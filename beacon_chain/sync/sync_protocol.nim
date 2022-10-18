@@ -59,14 +59,14 @@ type
     else:
       index: uint32
 
-  BeaconSyncNetworkState = ref object
+  BeaconSyncNetworkState = ref object of BaseNetworkState
     dag: ChainDAGRef
     cfg: RuntimeConfig
     forkDigests: ref ForkDigests
     genesisBlockRoot: Eth2Digest
     getBeaconTime: GetBeaconTimeFn
 
-  BeaconSyncPeerState* = ref object
+  BeaconSyncPeerState* = ref object of BasePeerState
     statusLastTime*: chronos.Moment
     statusMsg*: StatusMsg
 

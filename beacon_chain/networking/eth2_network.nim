@@ -37,7 +37,7 @@ import
 export
   tables, chronos, version, multiaddress, peerinfo, p2pProtocol, connection,
   libp2p_json_serialization, eth2_ssz_serialization, results, eth2_discovery,
-  peer_pool, peer_scores
+  peer_pool, peer_scores, BasePeerState, BaseNetworkState
 
 logScope:
   topics = "networking"
@@ -67,7 +67,7 @@ type
     wantedPeers*: int
     hardMaxPeers*: int
     peerPool*: PeerPool[Peer, PeerId]
-    protocolStates*: seq[RootRef]
+    protocolStates*: seq[BaseNetworkState]
     metadata*: altair.MetaData
     connectTimeout*: chronos.Duration
     seenThreshold*: chronos.Duration
@@ -97,7 +97,7 @@ type
     peerId*: PeerId
     discoveryId*: Eth2DiscoveryId
     connectionState*: ConnectionState
-    protocolStates*: seq[RootRef]
+    protocolStates*: seq[BasePeerState]
     netThroughput: AverageThroughput
     score*: int
     requestQuota*: float
@@ -164,8 +164,8 @@ type
     ServerError
     ResourceUnavailable
 
-  PeerStateInitializer* = proc(peer: Peer): RootRef {.gcsafe, raises: [Defect].}
-  NetworkStateInitializer* = proc(network: EthereumNode): RootRef {.gcsafe, raises: [Defect].}
+  PeerStateInitializer* = proc(peer: Peer): BasePeerState {.gcsafe, raises: [Defect].}
+  NetworkStateInitializer* = proc(network: EthereumNode): BaseNetworkState {.gcsafe, raises: [Defect].}
   OnPeerConnectedHandler* = proc(peer: Peer, incoming: bool): Future[void] {.gcsafe, raises: [Defect].}
   OnPeerDisconnectedHandler* = proc(peer: Peer): Future[void] {.gcsafe, raises: [Defect].}
   ThunkProc* = LPProtoHandler
@@ -1820,7 +1820,7 @@ proc init(T: type Peer, network: Eth2Node, peerId: PeerId): Peer =
     connectionState: ConnectionState.None,
     lastReqTime: now(chronos.Moment),
     lastMetadataTime: now(chronos.Moment),
-    protocolStates: newSeq[RootRef](len(allProtocols))
+    protocolStates: newSeq[BasePeerState](len(allProtocols))
   )
   for i in 0 ..< len(allProtocols):
     let proto = allProtocols[i]
