@@ -1513,7 +1513,7 @@ proc handleValidatorDuties*(node: BeaconNode, lastSlot, slot: Slot) {.async.} =
       let
         afterBlockTime = node.beaconClock.now() + afterBlockDelay
         afterBlockCutoff = node.beaconClock.fromNow(
-          min(afterBlockTime, slot.attestation_deadline() + afterBlockDelay))
+          min(afterBlockTime, slot.attestation_deadline()))
 
       if afterBlockCutoff.inFuture:
         debug "Got block, waiting to send attestations",
