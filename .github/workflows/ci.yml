@@ -37,7 +37,7 @@ jobs:
         include:
           - target:
               os: linux
-            builder: [self-hosted]
+            builder: [self-hosted, ubuntu-20.04]
             shell: bash
           - target:
               os: macos
