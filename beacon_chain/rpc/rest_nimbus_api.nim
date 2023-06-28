@@ -1,4 +1,5 @@
-# Copyright (c) 2018-2021 Status Research & Development GmbH
+# beacon_chain
+# Copyright (c) 2018-2023 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -11,7 +12,7 @@ import
   libp2p/[multiaddress, multicodec, peerstore],
   libp2p/protocols/pubsub/pubsubpeer,
   ./rest_utils,
-  ../eth1/eth1_monitor,
+  ../el/el_manager,
   ../validators/validator_duties,
   ../spec/[forks, beacon_time],
   ../beacon_node, ../nimbus_binary_common
@@ -67,7 +68,6 @@ type
   RestPubSubPeer* = object
     peerId*: PeerId
     score*: float64
-    iWantBudget*: int
     iHaveBudget*: int
     outbound*: bool
     appScore*: float64
@@ -103,7 +103,6 @@ proc toNode(v: PubSubPeer, backoff: Moment): RestPubSubPeer =
   RestPubSubPeer(
     peerId: v.peerId,
     score: v.score,
-    iWantBudget: v.iWantBudget,
     iHaveBudget: v.iHaveBudget,
     outbound: v.outbound,
     appScore: v.appScore,
@@ -240,9 +239,9 @@ proc installNimbusApiHandlers*(router: var RestRouter, node: BeaconNode) =
           return RestApiResponse.jsonError(Http503, BeaconNodeInSyncError,
                                            $res.error())
         let tres = res.get()
-        if tres.optimistic:
+        if not tres.executionValid:
           return RestApiResponse.jsonError(Http503, BeaconNodeInSyncError)
-        tres.head
+        tres
     let proposalState = assignClone(node.dag.headState)
     node.dag.withUpdatedState(
         proposalState[],
@@ -429,3 +428,27 @@ proc installNimbusApiHandlers*(router: var RestRouter, node: BeaconNode) =
         all_peers: allPeers
       )
     )
+
+  router.api(MethodPost, "/nimbus/v1/timesync") do (
+    contentBody: Option[ContentBody]) -> RestApiResponse:
+    let
+      timestamp2 = getTimestamp()
+      timestamp1 =
+        block:
+          if contentBody.isNone():
+            return RestApiResponse.jsonError(Http400, EmptyRequestBodyError)
+          let dres = decodeBody(RestNimbusTimestamp1, contentBody.get())
+          if dres.isErr():
+            return RestApiResponse.jsonError(Http400,
+                                             InvalidTimestampValue,
+                                             $dres.error())
+          dres.get().timestamp1
+    let
+      delay = node.processingDelay.valueOr: ZeroDuration
+      response = RestNimbusTimestamp2(
+        timestamp1: timestamp1,
+        timestamp2: timestamp2,
+        timestamp3: getTimestamp(),
+        delay: uint64(delay.nanoseconds)
+      )
+    return RestApiResponse.jsonResponsePlain(response)

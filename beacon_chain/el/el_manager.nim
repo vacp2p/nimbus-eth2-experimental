@@ -14,7 +14,7 @@ import
   json_rpc/[client, errors],
   web3, web3/ethhexstrings, web3/engine_api,
   eth/common/[eth_types, transaction],
-  eth/async_utils, stew/[byteutils, objects, results, shims/hashes],
+  eth/async_utils, stew/[assign2, byteutils, objects, results, shims/hashes],
   # Local modules:
   ../spec/[deposit_snapshots, eth2_merkleization, forks, helpers],
   ../spec/datatypes/[base, phase0, bellatrix, deneb],
@@ -25,6 +25,7 @@ import
 
 from std/times import getTime, inSeconds, initTime, `-`
 from ../spec/engine_authentication import getSignedIatToken
+from ../spec/state_transition_block import kzg_commitment_to_versioned_hash
 
 export
   el_conf, engine_api, deques, base, DepositTreeSnapshot
@@ -84,11 +85,13 @@ const
   engineApiConnectionTimeout = 5.seconds  # How much we wait before giving up connecting to the Engine API
   web3RequestsTimeout* = 8.seconds # How much we wait for eth_* requests (e.g. eth_getBlockByHash)
 
-  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.2/src/engine/specification.md#request-2
+  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/paris.md#request-2
+  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/shanghai.md#request-2
   GETPAYLOAD_TIMEOUT = 1.seconds
 
-  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.2/src/engine/experimental/blob-extension.md#engine_getblobsbundlev1
-  GETBLOBS_TIMEOUT = 1.seconds
+  connectionStateChangeHysteresisThreshold = 15
+    ## How many unsuccesful/successful requests we must see
+    ## before declaring the connection as degraded/restored
 
 type
   Eth1BlockNumber* = uint64
@@ -133,10 +136,6 @@ type
     hasConsensusViolation: bool
       ## The local chain contradicts the observed consensus on the network
 
-  NoPayloadAttributesType = object
-    ## A type with exactly one value, and which is not constructed via a `nil`
-    ## value for a ref object, which which Nim 1.6 crashes with an ICE.
-
   NextExpectedPayloadParams* = object
     headBlockHash*: Eth2Digest
     safeBlockHash*: Eth2Digest
@@ -145,7 +144,7 @@ type
 
   ELManager* = ref object
     eth1Network: Option[Eth1Network]
-      ## If this value is supplied the EL monitor will check whether
+      ## If this value is supplied the EL manager will check whether
       ## all configured EL nodes are connected to the same network.
 
     depositContractAddress*: Eth1Address
@@ -181,7 +180,6 @@ type
 
   EtcStatus {.pure.} = enum
     notExchangedYet
-    exchangeError
     mismatch
     match
 
@@ -211,6 +209,7 @@ type
       ## exchange.
 
     state: ConnectionState
+    hysteresisCounter: int
 
     depositContractSyncStatus: DepositContractSyncStatus
       ## Are we sure that this EL has synced the deposit contract?
@@ -244,19 +243,10 @@ type
     executionPayload*: ExecutionPayloadV1
     blockValue*: UInt256
 
-  CancunExecutionPayloadAndBlobs* = object
-    executionPayload*: ExecutionPayloadV3
-    blockValue*: UInt256
-    kzgs*: seq[engine_api.KZGCommitment]
-    blobs*: seq[engine_api.Blob]
-
   SomeEnginePayloadWithValue =
     BellatrixExecutionPayloadWithValue |
     GetPayloadV2Response |
-    CancunExecutionPayloadAndBlobs
-
-const
-  NoPayloadAttributes* = default(NoPayloadAttributesType)
+    GetPayloadV3Response
 
 declareCounter failed_web3_requests,
   "Failed web3 requests"
@@ -293,35 +283,65 @@ declareCounter engine_api_last_minute_forkchoice_updates_sent,
   "Number of last minute requests to the forkchoiceUpdated Engine API end-point just before block proposals",
   labels = ["url"]
 
+proc close(connection: ELConnection): Future[void] {.async.} =
+  if connection.web3.isSome:
+    awaitWithTimeout(connection.web3.get.close(), 30.seconds):
+      debug "Failed to close data provider in time"
+
+proc increaseCounterTowardsStateChange(connection: ELConnection): bool =
+  result = connection.hysteresisCounter >= connectionStateChangeHysteresisThreshold
+  if result:
+    connection.hysteresisCounter = 0
+  else:
+    inc connection.hysteresisCounter
+
+proc decreaseCounterTowardsStateChange(connection: ELConnection) =
+  if connection.hysteresisCounter > 0:
+    # While we increase the counter by 1, we decreate it by 20% in order
+    # to require a steady and affirmative change instead of allowing
+    # the counter to drift very slowly in one direction when the ratio
+    # between success and failure is roughly 50:50%
+    connection.hysteresisCounter = connection.hysteresisCounter div 5
+
 proc setDegradedState(connection: ELConnection,
                       requestName: string,
                       statusCode: int, errMsg: string) =
+  debug "Failed EL Request", requestName, statusCode, err = errMsg
+
   case connection.state
   of NeverTested, Working:
-    warn "Connection to EL node degraded",
-      url = url(connection.engineUrl),
-      failedRequest = requestName,
-      statusCode, err = errMsg
-  of Degraded:
-    discard
+    if connection.increaseCounterTowardsStateChange():
+      warn "Connection to EL node degraded",
+        url = url(connection.engineUrl),
+        failedRequest = requestName,
+        statusCode, err = errMsg
 
-  reset connection.web3
-  connection.state = Degraded
+      connection.state = Degraded
+
+      asyncSpawn connection.close()
+      connection.web3 = none[Web3]()
+  of Degraded:
+    connection.decreaseCounterTowardsStateChange()
 
 proc setWorkingState(connection: ELConnection) =
   case connection.state
+  of NeverTested:
+    connection.hysteresisCounter = 0
+    connection.state = Working
   of Degraded:
-    info "Connection to EL node restored",
-      url = url(connection.engineUrl)
-  of NeverTested, Working:
-    discard
-  connection.state = Working
+    if connection.increaseCounterTowardsStateChange():
+      info "Connection to EL node restored",
+        url = url(connection.engineUrl)
+
+      connection.state = Working
+  of Working:
+    connection.decreaseCounterTowardsStateChange()
 
 proc trackEngineApiRequest(connection: ELConnection,
                            request: FutureBase, requestName: string,
                            startTime: Moment, deadline: Future[void],
                            failureAllowed = false) =
-  request.addCallback do (udata: pointer) {.gcsafe, raises: [Defect].}:
+  request.addCallback do (udata: pointer) {.gcsafe, raises: [].}:
     # TODO `udata` is nil here. How come?
     # This forces us to create a GC cycle between the Future and the closure
     if request.completed:
@@ -331,10 +351,12 @@ proc trackEngineApiRequest(connection: ELConnection,
 
       connection.setWorkingState()
 
-  deadline.addCallback do (udata: pointer) {.gcsafe, raises: [Defect].}:
+  deadline.addCallback do (udata: pointer) {.gcsafe, raises: [].}:
     if not request.finished:
       request.cancel()
       engine_api_timeouts.inc(1, [connection.engineUrl.url, requestName])
+      if not failureAllowed:
+        connection.setDegradedState(requestName, 0, "Request timed out")
     else:
       let statusCode = if not request.failed:
         200
@@ -403,11 +425,11 @@ template toGaugeValue(x: Quantity): int64 =
 #  doAssert SECONDS_PER_ETH1_BLOCK * cfg.ETH1_FOLLOW_DISTANCE < GENESIS_DELAY,
 #             "Invalid configuration: GENESIS_DELAY is set too low"
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/validator.md#get_eth1_data
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/phase0/validator.md#get_eth1_data
 func compute_time_at_slot(genesis_time: uint64, slot: Slot): uint64 =
   genesis_time + slot * SECONDS_PER_SLOT
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/phase0/validator.md#get_eth1_data
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/phase0/validator.md#get_eth1_data
 func voting_period_start_time(state: ForkedHashedBeaconState): uint64 =
   let eth1_voting_period_start_slot =
     getStateField(state, slot) - getStateField(state, slot) mod
@@ -415,7 +437,7 @@ func voting_period_start_time(state: ForkedHashedBeaconState): uint64 =
   compute_time_at_slot(
     getStateField(state, genesis_time), eth1_voting_period_start_slot)
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/validator.md#get_eth1_data
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/phase0/validator.md#get_eth1_data
 func is_candidate_block(cfg: RuntimeConfig,
                         blk: Eth1Block,
                         period_start: uint64): bool =
@@ -433,7 +455,7 @@ func asConsensusWithdrawal(w: WithdrawalV1): capella.Withdrawal =
     index: w.index.uint64,
     validator_index: w.validatorIndex.uint64,
     address: ExecutionAddress(data: w.address.distinctBase),
-    amount: GWei w.amount)
+    amount: Gwei w.amount)
 
 func asEngineWithdrawal(w: capella.Withdrawal): WithdrawalV1 =
   WithdrawalV1(
@@ -524,24 +546,25 @@ func asConsensusType*(rpcExecutionPayload: ExecutionPayloadV3):
     timestamp: rpcExecutionPayload.timestamp.uint64,
     extra_data: List[byte, MAX_EXTRA_DATA_BYTES].init(rpcExecutionPayload.extraData.bytes),
     base_fee_per_gas: rpcExecutionPayload.baseFeePerGas,
-    excess_data_gas: rpcExecutionPayload.excessDataGas,
     block_hash: rpcExecutionPayload.blockHash.asEth2Digest,
     transactions: List[bellatrix.Transaction, MAX_TRANSACTIONS_PER_PAYLOAD].init(
       mapIt(rpcExecutionPayload.transactions, it.getTransaction)),
     withdrawals: List[capella.Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD].init(
-      mapIt(rpcExecutionPayload.withdrawals, it.asConsensusWithdrawal)))
+      mapIt(rpcExecutionPayload.withdrawals, it.asConsensusWithdrawal)),
+    data_gas_used: rpcExecutionPayload.dataGasUsed.uint64,
+    excess_data_gas: rpcExecutionPayload.excessDataGas.uint64)
 
-func asConsensusType*(cancunPayload: CancunExecutionPayloadAndBlobs):
+func asConsensusType*(payload: engine_api.GetPayloadV3Response):
     deneb.ExecutionPayloadForSigning =
   deneb.ExecutionPayloadForSigning(
-    executionPayload: cancunPayload.executionPayload.asConsensusType,
-    blockValue: cancunPayload.blockValue,
+    executionPayload: payload.executionPayload.asConsensusType,
+    blockValue: payload.blockValue,
     # TODO
     # The `mapIt` calls below are necessary only because we use different distinct
     # types for KZG commitments and Blobs in the `web3` and the `deneb` spec types.
     # Both are defined as `array[N, byte]` under the hood.
-    kzgs: KZGCommitments cancunPayload.kzgs.mapIt(it.bytes),
-    blobs: Blobs cancunPayload.blobs.mapIt(it.bytes)
+    kzgs: KzgCommitments payload.blobsBundle.commitments.mapIt(it.bytes),
+    blobs: Blobs payload.blobsBundle.blobs.mapIt(it.bytes)
   )
 
 func asEngineExecutionPayload*(executionPayload: bellatrix.ExecutionPayload):
@@ -614,10 +637,11 @@ func asEngineExecutionPayload*(executionPayload: deneb.ExecutionPayload):
     timestamp: Quantity(executionPayload.timestamp),
     extraData: DynamicBytes[0, MAX_EXTRA_DATA_BYTES](executionPayload.extra_data),
     baseFeePerGas: executionPayload.base_fee_per_gas,
-    excessDataGas: executionPayload.excess_data_gas,
     blockHash: executionPayload.block_hash.asBlockHash,
     transactions: mapIt(executionPayload.transactions, it.getTypedTransaction),
-    withdrawals: mapIt(executionPayload.withdrawals, it.asEngineWithdrawal))
+    withdrawals: mapIt(executionPayload.withdrawals, it.asEngineWithdrawal),
+    dataGasUsed: Quantity(executionPayload.data_gas_used),
+    excessDataGas: Quantity(executionPayload.excess_data_gas))
 
 func shortLog*(b: Eth1Block): string =
   try:
@@ -669,11 +693,6 @@ func toVoteData(blk: Eth1Block): Eth1Data =
 func hash*(x: Eth1Data): Hash =
   hash(x.block_hash)
 
-proc close(connection: ELConnection): Future[void] {.async.} =
-  if connection.web3.isSome:
-    awaitWithTimeout(connection.web3.get.close(), 30.seconds):
-      debug "Failed to close data provider in time"
-
 func isConnected(connection: ELConnection): bool =
   connection.web3.isSome
 
@@ -689,7 +708,9 @@ func getJsonRpcRequestHeaders(jwtSecret: Option[seq[byte]]):
     (proc(): seq[(string, string)] = @[])
 
 proc newWeb3*(engineUrl: EngineApiUrl): Future[Web3] =
-  newWeb3(engineUrl.url, getJsonRpcRequestHeaders(engineUrl.jwtSecret))
+  newWeb3(engineUrl.url,
+          getJsonRpcRequestHeaders(engineUrl.jwtSecret),
+          httpFlags = {HttpClientFlag.NewConnectionAlways})
 
 proc establishEngineApiConnection*(url: EngineApiUrl):
                                    Future[Result[Web3, string]] {.async.} =
@@ -740,13 +761,6 @@ proc getBlockByNumber*(rpcClient: RpcClient,
 
   rpcClient.eth_getBlockByNumber(hexNumber, false)
 
-proc getBlock(rpcClient: RpcClient, id: BlockHashOrNumber): Future[BlockObject] =
-  if id.isHash:
-    let hash = id.hash.asBlockHash()
-    return rpcClient.getBlockByHash(hash)
-  else:
-    return rpcClient.getBlockByNumber(id.number)
-
 func areSameAs(expectedParams: Option[NextExpectedPayloadParams],
                latestHead, latestSafe, latestFinalized: Eth2Digest,
                timestamp: uint64,
@@ -764,16 +778,13 @@ func areSameAs(expectedParams: Option[NextExpectedPayloadParams],
 
 proc forkchoiceUpdated(rpcClient: RpcClient,
                        state: ForkchoiceStateV1,
-                       payloadAttributes: PayloadAttributesV1 |
-                                          PayloadAttributesV2 |
-                                          NoPayloadAttributesType):
+                       payloadAttributes: Option[PayloadAttributesV1] |
+                                          Option[PayloadAttributesV2]):
                        Future[ForkchoiceUpdatedResponse] =
-  when payloadAttributes is NoPayloadAttributesType:
-    rpcClient.engine_forkchoiceUpdatedV1(state, none PayloadAttributesV1)
-  elif payloadAttributes is PayloadAttributesV1:
-    rpcClient.engine_forkchoiceUpdatedV1(state, some payloadAttributes)
-  elif payloadAttributes is PayloadAttributesV2:
-    rpcClient.engine_forkchoiceUpdatedV2(state, some payloadAttributes)
+  when payloadAttributes is Option[PayloadAttributesV1]:
+    rpcClient.engine_forkchoiceUpdatedV1(state, payloadAttributes)
+  elif payloadAttributes is Option[PayloadAttributesV2]:
+    rpcClient.engine_forkchoiceUpdatedV2(state, payloadAttributes)
   else:
     static: doAssert false
 
@@ -806,17 +817,18 @@ proc getPayloadFromSingleEL(
             headBlockHash: headBlock.asBlockHash,
             safeBlockHash: safeBlock.asBlockHash,
             finalizedBlockHash: finalizedBlock.asBlockHash),
-          PayloadAttributesV1(
+          some PayloadAttributesV1(
             timestamp: Quantity timestamp,
             prevRandao: FixedBytes[32] randomData.data,
             suggestedFeeRecipient: suggestedFeeRecipient))
-      elif GetPayloadResponseType is engine_api.GetPayloadV2Response or GetPayloadResponseType is CancunExecutionPayloadAndBlobs:
+      elif GetPayloadResponseType is engine_api.GetPayloadV2Response or
+           GetPayloadResponseType is engine_api.GetPayloadV3Response:
         let response = await rpcClient.forkchoiceUpdated(
           ForkchoiceStateV1(
             headBlockHash: headBlock.asBlockHash,
             safeBlockHash: safeBlock.asBlockHash,
             finalizedBlockHash: finalizedBlock.asBlockHash),
-          PayloadAttributesV2(
+          some PayloadAttributesV2(
             timestamp: Quantity timestamp,
             prevRandao: FixedBytes[32] randomData.data,
             suggestedFeeRecipient: suggestedFeeRecipient,
@@ -835,19 +847,7 @@ proc getPayloadFromSingleEL(
     else:
       raise newException(CatchableError, "No confirmed execution head yet")
 
-  when GetPayloadResponseType is CancunExecutionPayloadAndBlobs:
-    let
-      response = await engine_api.getPayload(rpcClient,
-                                             GetPayloadV3Response,
-                                             payloadId)
-      blobsBundle = await engine_getBlobsBundleV1(rpcClient, payloadId)
-    # TODO validate the blobs bundle
-    return CancunExecutionPayloadAndBlobs(
-      executionPayload: response.executionPayload,
-      blockValue: response.blockValue,
-      kzgs: blobsBundle.kzgs, # TODO Avoid the copies here with `move`
-      blobs: blobsBundle.blobs)
-  elif GetPayloadResponseType is BellatrixExecutionPayloadWithValue:
+  when GetPayloadResponseType is BellatrixExecutionPayloadWithValue:
     let payload= await engine_api.getPayload(rpcClient, ExecutionPayloadV1, payloadId)
     return BellatrixExecutionPayloadWithValue(
       executionPayload: payload,
@@ -865,7 +865,7 @@ template EngineApiResponseType*(T: type capella.ExecutionPayloadForSigning): typ
   engine_api.GetPayloadV2Response
 
 template EngineApiResponseType*(T: type deneb.ExecutionPayloadForSigning): type =
-  CancunExecutionPayloadAndBlobs
+  engine_api.GetPayloadV3Response
 
 template payload(response: engine_api.ExecutionPayloadV1): engine_api.ExecutionPayloadV1 =
   response
@@ -906,12 +906,7 @@ proc getPayload*(m: ELManager,
     randomData, suggestedFeeRecipient, engineApiWithdrawals)
 
   let
-    timeout = when PayloadType is deneb.ExecutionPayloadForSigning:
-      # TODO We should follow the spec and track the timeouts of
-      #      the individual engine API calls inside `getPayloadFromSingleEL`.
-      GETPAYLOAD_TIMEOUT + GETBLOBS_TIMEOUT
-    else:
-      GETPAYLOAD_TIMEOUT
+    timeout = GETPAYLOAD_TIMEOUT
     deadline = sleepAsync(timeout)
     requests = m.elConnections.mapIt(it.getPayloadFromSingleEL(
       EngineApiResponseType(PayloadType),
@@ -943,9 +938,19 @@ proc getPayload*(m: ELManager,
             continue
 
         if engineApiWithdrawals != req.read.executionPayload.withdrawals.maybeDeref:
+          # otherwise it formats as "@[(index: ..., validatorIndex: ...,
+          # address: ..., amount: ...), (index: ..., validatorIndex: ...,
+          # address: ..., amount: ...)]"
           warn "Execution client did not return correct withdrawals",
-            withdrawals_from_cl = engineApiWithdrawals,
-            withdrawals_from_el = req.read.executionPayload.withdrawals
+            withdrawals_from_cl_len = engineApiWithdrawals.len,
+            withdrawals_from_el_len =
+              req.read.executionPayload.withdrawals.maybeDeref.len,
+            withdrawals_from_cl =
+              mapIt(engineApiWithdrawals, it.asConsensusWithdrawal),
+            withdrawals_from_el =
+              mapIt(
+                req.read.executionPayload.withdrawals.maybeDeref,
+                it.asConsensusWithdrawal)
 
       if req.read.executionPayload.extraData.len > MAX_EXTRA_DATA_BYTES:
         warn "Execution client provided a block with invalid extraData (size exceeds limit)",
@@ -1052,10 +1057,11 @@ proc sendNewPayloadToSingleEL(connection: ELConnection,
   return await rpcClient.engine_newPayloadV2(payload)
 
 proc sendNewPayloadToSingleEL(connection: ELConnection,
-                              payload: engine_api.ExecutionPayloadV3):
+                              payload: engine_api.ExecutionPayloadV3,
+                              versioned_hashes: seq[engine_api.VersionedHash]):
                               Future[PayloadStatusV1] {.async.} =
   let rpcClient = await connection.connectedRpcClient()
-  return await rpcClient.engine_newPayloadV3(payload)
+  return await rpcClient.engine_newPayloadV3(payload, versioned_hashes)
 
 type
   StatusRelation = enum
@@ -1147,15 +1153,28 @@ proc processResponse[ELResponseType](
             url2 = connections[idx].engineUrl.url,
             status2 = status
 
-proc sendNewPayload*(m: ELManager,
-                     payload: engine_api.ExecutionPayloadV1 | engine_api.ExecutionPayloadV2 | engine_api.ExecutionPayloadV3):
+proc sendNewPayload*(m: ELManager, blockBody: SomeForkyBeaconBlockBody):
                      Future[PayloadExecutionStatus] {.async.} =
   let
     earlyDeadline = sleepAsync(chronos.seconds 1)
     startTime = Moment.now
     deadline = sleepAsync(NEWPAYLOAD_TIMEOUT)
+    payload = blockBody.execution_payload.asEngineExecutionPayload
     requests = m.elConnections.mapIt:
-      let req = sendNewPayloadToSingleEL(it, payload)
+      let req =
+        when payload is engine_api.ExecutionPayloadV3:
+          # https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.1/specs/deneb/beacon-chain.md#process_execution_payload
+          # Verify the execution payload is valid
+          # [Modified in Deneb] Pass `versioned_hashes` to Execution Engine
+          let versioned_hashes = mapIt(
+            blockBody.blob_kzg_commitments,
+            engine_api.VersionedHash(kzg_commitment_to_versioned_hash(it)))
+          sendNewPayloadToSingleEL(it, payload, versioned_hashes)
+        elif payload is engine_api.ExecutionPayloadV1 or
+             payload is engine_api.ExecutionPayloadV2:
+          sendNewPayloadToSingleEL(it, payload)
+        else:
+          static: doAssert false
       trackEngineApiRequest(it, req, "newPayload", startTime, deadline)
       req
 
@@ -1194,8 +1213,8 @@ proc sendNewPayload*(m: ELManager,
 proc forkchoiceUpdatedForSingleEL(
     connection: ELConnection,
     state: ref ForkchoiceStateV1,
-    payloadAttributes: PayloadAttributesV1 | PayloadAttributesV2 |
-                       NoPayloadAttributesType):
+    payloadAttributes: Option[PayloadAttributesV1] |
+                       Option[PayloadAttributesV2]):
     Future[PayloadStatusV1] {.async.} =
   let
     rpcClient = await connection.connectedRpcClient()
@@ -1213,9 +1232,10 @@ proc forkchoiceUpdatedForSingleEL(
   return response.payloadStatus
 
 proc forkchoiceUpdated*(m: ELManager,
-                        headBlockHash, safeBlockHash, finalizedBlockHash: Eth2Digest,
-                        payloadAttributes: PayloadAttributesV1 | PayloadAttributesV2 |
-                                           NoPayloadAttributesType):
+                        headBlockHash, safeBlockHash,
+                        finalizedBlockHash: Eth2Digest,
+                        payloadAttributes: Option[PayloadAttributesV1] |
+                                           Option[PayloadAttributesV2]):
                         Future[(PayloadExecutionStatus, Option[BlockHash])] {.async.} =
   doAssert not headBlockHash.isZero
 
@@ -1226,33 +1246,33 @@ proc forkchoiceUpdated*(m: ELManager,
   # block hash provided by this event is stubbed with
   # `0x0000000000000000000000000000000000000000000000000000000000000000`."
   # and
-  # https://github.com/ethereum/consensus-specs/blob/v1.2.0-rc.3/specs/bellatrix/validator.md#executionpayload
+  # https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/bellatrix/validator.md#executionpayload
   # notes "`finalized_block_hash` is the hash of the latest finalized execution
   # payload (`Hash32()` if none yet finalized)"
 
   if m.elConnections.len == 0:
     return (PayloadExecutionStatus.syncing, none BlockHash)
 
-  when payloadAttributes is PayloadAttributesV2:
-    template payloadAttributesV2(): auto = payloadAttributes
-  elif payloadAttributes is PayloadAttributesV1:
-    template payloadAttributesV2(): auto = PayloadAttributesV2(
-      timestamp: payloadAttributes.timestamp,
-      prevRandao: payloadAttributes.prevRandao,
-      suggestedFeeRecipient: payloadAttributes.suggestedFeeRecipient,
-      withdrawals: @[])
-  elif payloadAttributes is NoPayloadAttributesType:
+  when payloadAttributes is Option[PayloadAttributesV2]:
     template payloadAttributesV2(): auto =
-      # Because timestamp and prevRandao are both 0, won't false-positive match
-      (static(default(PayloadAttributesV2)))
+      if payloadAttributes.isSome:
+        payloadAttributes.get
+      else:
+        # As timestamp and prevRandao are both 0, won't false-positive match
+        (static(default(PayloadAttributesV2)))
+  elif payloadAttributes is Option[PayloadAttributesV1]:
+    template payloadAttributesV2(): auto =
+      if payloadAttributes.isSome:
+        PayloadAttributesV2(
+          timestamp: payloadAttributes.get.timestamp,
+          prevRandao: payloadAttributes.get.prevRandao,
+          suggestedFeeRecipient: payloadAttributes.get.suggestedFeeRecipient,
+          withdrawals: @[])
+      else:
+        # As timestamp and prevRandao are both 0, won't false-positive match
+        (static(default(PayloadAttributesV2)))
   else:
     static: doAssert false
-
-  m.nextExpectedPayloadParams = some NextExpectedPayloadParams(
-    headBlockHash: headBlockHash,
-    safeBlockHash: safeBlockHash,
-    finalizedBlockHash: finalizedBlockHash,
-    payloadAttributes: payloadAttributesV2)
 
   let
     state = newClone ForkchoiceStateV1(
@@ -1280,9 +1300,24 @@ proc forkchoiceUpdated*(m: ELManager,
     elif req.completed:
       responseProcessor.processResponse(m.elConnections, requests, idx)
 
+  template assignNextExpectedPayloadParams() =
+    # Ensure that there's no race condition window where getPayload's check for
+    # whether it needs to trigger a new fcU payload, due to cache invalidation,
+    # falsely suggests that the expected payload matches, and similarly that if
+    # the fcU fails or times out for other reasons, the expected payload params
+    # remain synchronized with EL state.
+    assign(
+      m.nextExpectedPayloadParams,
+      some NextExpectedPayloadParams(
+        headBlockHash: headBlockHash,
+        safeBlockHash: safeBlockHash,
+        finalizedBlockHash: finalizedBlockHash,
+        payloadAttributes: payloadAttributesV2))
+
   if responseProcessor.disagreementAlreadyDetected:
     return (PayloadExecutionStatus.invalid, none BlockHash)
   elif responseProcessor.selectedResponse.isSome:
+    assignNextExpectedPayloadParams()
     return (requests[responseProcessor.selectedResponse.get].read.status,
             requests[responseProcessor.selectedResponse.get].read.latestValidHash)
 
@@ -1295,16 +1330,11 @@ proc forkchoiceUpdated*(m: ELManager,
   return if responseProcessor.disagreementAlreadyDetected:
     (PayloadExecutionStatus.invalid, none BlockHash)
   elif responseProcessor.selectedResponse.isSome:
+    assignNextExpectedPayloadParams()
     (requests[responseProcessor.selectedResponse.get].read.status,
      requests[responseProcessor.selectedResponse.get].read.latestValidHash)
   else:
     (PayloadExecutionStatus.syncing, none BlockHash)
-
-proc forkchoiceUpdatedNoResult*(m: ELManager,
-                                headBlockHash, safeBlockHash, finalizedBlockHash: Eth2Digest,
-                                payloadAttributes: PayloadAttributesV1 | PayloadAttributesV2) {.async.} =
-  discard await m.forkchoiceUpdated(
-    headBlockHash, safeBlockHash, finalizedBlockHash, payloadAttributes)
 
 # TODO can't be defined within exchangeConfigWithSingleEL
 func `==`(x, y: Quantity): bool {.borrow.}
@@ -1342,45 +1372,22 @@ proc exchangeConfigWithSingleEL(m: ELManager, connection: ELConnection) {.async.
       debug "Failed to obtain eth_chainId",
              error = exc.msg
 
-  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.2/src/engine/specification.md#engine_exchangetransitionconfigurationv1
+  connection.etcStatus = EtcStatus.match
+
+  # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/paris.md#engine_exchangetransitionconfigurationv1
   let
     ourConf = TransitionConfigurationV1(
       terminalTotalDifficulty: m.eth1Chain.cfg.TERMINAL_TOTAL_DIFFICULTY,
       terminalBlockHash: m.eth1Chain.cfg.TERMINAL_BLOCK_HASH,
       terminalBlockNumber: Quantity 0)
-    elConf = try:
-      connection.trackedRequestWithTimeout(
-        "exchangeTransitionConfiguration",
-        rpcClient.engine_exchangeTransitionConfigurationV1(ourConf),
-        timeout = 1.seconds)
-    except CatchableError as err:
-      warn "Failed to exchange transition configuration",
-            url = connection.engineUrl, err = err.msg
-      connection.etcStatus = EtcStatus.exchangeError
-      return
-
-  connection.etcStatus =
-    if ourConf.terminalTotalDifficulty != elConf.terminalTotalDifficulty:
-      warn "Engine API configured with different terminal total difficulty",
-            engineAPI_value = elConf.terminalTotalDifficulty,
-            localValue = ourConf.terminalTotalDifficulty
-      EtcStatus.mismatch
-    elif ourConf.terminalBlockNumber != elConf.terminalBlockNumber:
-      warn "Engine API reporting different terminal block number",
-            engineAPI_value = elConf.terminalBlockNumber.uint64,
-            localValue = ourConf.terminalBlockNumber.uint64
-      EtcStatus.mismatch
-    elif ourConf.terminalBlockHash != elConf.terminalBlockHash:
-      warn "Engine API reporting different terminal block hash",
-            engineAPI_value = elConf.terminalBlockHash,
-            localValue = ourConf.terminalBlockHash
-      EtcStatus.mismatch
-    else:
-      if connection.etcStatus == EtcStatus.notExchangedYet:
-        # Log successful engine configuration exchange once at startup
-        info "Successfully exchanged engine configuration",
-             url = connection.engineUrl
-      EtcStatus.match
+  try:
+    discard connection.trackedRequestWithTimeout(
+      "exchangeTransitionConfiguration",
+      rpcClient.engine_exchangeTransitionConfigurationV1(ourConf),
+      timeout = 1.seconds)
+  except CatchableError as err:
+    warn "Failed to exchange transition configuration",
+          url = connection.engineUrl, err = err.msg
 
 proc exchangeTransitionConfiguration*(m: ELManager) {.async.} =
   if m.elConnections.len == 0:
@@ -1396,7 +1403,6 @@ proc exchangeTransitionConfiguration*(m: ELManager) {.async.} =
   var cancelled = 0
   for idx, req in requests:
     if not req.finished:
-      m.elConnections[idx].etcStatus = EtcStatus.exchangeError
       req.cancel()
       inc cancelled
 
@@ -1645,7 +1651,7 @@ proc trackFinalizedState(chain: var Eth1Chain,
     else:
       error "Corrupted deposits history detected",
             ourDepositsCount = matchingBlock.depositCount,
-            taretDepositsCount = finalizedEth1Data.deposit_count,
+            targetDepositsCount = finalizedEth1Data.deposit_count,
             ourDepositsRoot = matchingBlock.depositRoot,
             targetDepositsRoot = finalizedEth1Data.deposit_root
       chain.hasConsensusViolation = true
@@ -1667,7 +1673,7 @@ template trackFinalizedState*(m: ELManager,
                               finalizedStateDepositIndex: uint64): bool =
   trackFinalizedState(m.eth1Chain, finalizedEth1Data, finalizedStateDepositIndex)
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.2/specs/phase0/validator.md#get_eth1_data
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/phase0/validator.md#get_eth1_data
 proc getBlockProposalData*(chain: var Eth1Chain,
                            state: ForkedHashedBeaconState,
                            finalizedEth1Data: Eth1Data,
@@ -1975,18 +1981,24 @@ func init(T: type FullBlockId, blk: Eth1BlockHeader|BlockObject): T =
 func isNewLastBlock(m: ELManager, blk: Eth1BlockHeader|BlockObject): bool =
   m.latestEth1Block.isNone or blk.number.uint64 > m.latestEth1BlockNumber
 
+func hasConnection*(m: ELManager): bool =
+  m.elConnections.len > 0
+
+func hasAnyWorkingConnection*(m: ELManager): bool =
+  m.elConnections.anyIt(it.state == Working or it.state == NeverTested)
+
 func hasProperlyConfiguredConnection*(m: ELManager): bool =
   for connection in m.elConnections:
     if connection.etcStatus == EtcStatus.match:
       return true
 
-  return false
+  false
 
 proc startExchangeTransitionConfigurationLoop(m: ELManager) {.async.} =
   debug "Starting exchange transition configuration loop"
 
   while true:
-    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.2/src/engine/specification.md#engine_exchangetransitionconfigurationv1
+    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/paris.md#specification-3
     debug "Exchange transition configuration tick"
     traceAsyncErrors m.exchangeTransitionConfiguration()
     await sleepAsync(60.seconds)

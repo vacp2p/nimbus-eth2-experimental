@@ -528,12 +528,12 @@ proc cmdExportEra(conf: DbConf, cfg: RuntimeConfig) =
         eraRoot(
           forkyState.data.genesis_validators_root,
           forkyState.data.historical_roots.asSeq,
+          dag.headState.historical_summaries().asSeq,
           era).expect("have era root since we checked slot")
       name = eraFileName(cfg, era, eraRoot)
 
     if isFile(name):
       debug "Era file already exists", era, name
-      era += 1
       continue
 
     # Check if we reasonably could write the era file given what's in the

@@ -8,11 +8,9 @@
 {.used.}
 
 import
-  # Standard library
-  std/[json, sequtils, strutils, tables],
   # Status libraries
   stew/results, chronicles,
-  eth/keys, taskpools,
+  taskpools,
   # Internals
   ../../beacon_chain/spec/[helpers, forks, state_transition_block],
   ../../beacon_chain/spec/datatypes/[
@@ -28,7 +26,12 @@ import
   ../testutil, ../testdbutil,
   ./fixtures_utils, ./os_ops
 
-# Test format described at https://github.com/ethereum/consensus-specs/tree/v1.2.0-rc.1/tests/formats/fork_choice
+from std/json import
+  JsonNode, getBool, getInt, getStr, hasKey, items, len, pairs, `$`, `[]`
+from std/sequtils import toSeq
+from std/strutils import contains
+
+# Test format described at https://github.com/ethereum/consensus-specs/tree/v1.3.0/tests/formats/fork_choice
 # Note that our implementation has been optimized with "ProtoArray"
 # instead of following the spec (in particular the "store").
 
@@ -118,13 +121,9 @@ proc initialLoad(
   let
     validatorMonitor = newClone(ValidatorMonitor.init())
     dag = ChainDAGRef.init(
-      forkedState[].kind.genesisTestRuntimeConfig, db, validatorMonitor,
-      {enableTestFeatures, experimental})
+      forkedState[].kind.genesisTestRuntimeConfig, db, validatorMonitor, {})
     fkChoice = newClone(ForkChoice.init(
-      dag.getFinalizedEpochRef(),
-      dag.finalizedHead.blck,
-      true,
-    ))
+      dag.getFinalizedEpochRef(), dag.finalizedHead.blck))
 
   (dag, fkChoice)
 
@@ -349,9 +348,10 @@ proc doRunTest(path: string, fork: ConsensusFork) =
     of ConsensusFork.Phase0:
       initialLoad(path, db, phase0.BeaconState, phase0.BeaconBlock)
 
-  var
+  let
+    rng = HmacDrbgContext.new()
     taskpool = Taskpool.new()
-    verifier = BatchVerifier(rng: keys.newRng(), taskpool: taskpool)
+  var verifier = BatchVerifier(rng: rng, taskpool: taskpool)
 
   let steps = loadOps(path, fork)
   var time = stores.fkChoice.checkpoints.time
@@ -423,6 +423,8 @@ template fcSuite(suiteName: static[string], testPathElem: static[string]) =
     for kind, path in walkDir(presetPath, relative = true, checkDir = true):
       let testsPath = presetPath/path/testPathElem
       if kind != pcDir or not os_ops.dirExists(testsPath):
+        continue
+      if testsPath.contains("/eip6110/") or testsPath.contains("\\eip6110\\"):
         continue
       let fork = forkForPathComponent(path).valueOr:
         raiseAssert "Unknown test fork: " & testsPath

@@ -8,10 +8,10 @@
 import
   std/os,
   chronicles, chronos, stew/io2,
-  eth/db/kvstore_sqlite3, eth/keys,
-  ./eth1/eth1_monitor,
+  eth/db/kvstore_sqlite3,
+  ./el/el_manager,
   ./gossip_processing/optimistic_processor,
-  ./networking/topic_params,
+  ./networking/[topic_params, network_metadata],
   ./spec/beaconstate,
   ./spec/datatypes/[phase0, altair, bellatrix, capella, deneb],
   "."/[filepath, light_client, light_client_db, nimbus_binary_common, version]
@@ -65,9 +65,7 @@ programMain:
   let
     genesisState =
       try:
-        template genesisData(): auto = metadata.genesisData
-        newClone(readSszForkedHashedBeaconState(
-          cfg, genesisData.toOpenArrayByte(genesisData.low, genesisData.high)))
+        newClone(readSszForkedHashedBeaconState(cfg, metadata.genesisBytes))
       except CatchableError as err:
         raiseAssert "Invalid baked-in state: " & err.msg
 
@@ -81,7 +79,7 @@ programMain:
 
     genesisBlockRoot = get_initial_beacon_block(genesisState[]).root
 
-    rng = keys.newRng()
+    rng = HmacDrbgContext.new()
     netKeys = getRandomNetKeys(rng[])
     network = createEth2Node(
       rng, config, netKeys, cfg,
@@ -105,17 +103,33 @@ programMain:
         opt = signedBlock.toBlockId(),
         wallSlot = getBeaconTime().slotOrZero
       withBlck(signedBlock):
-        when consensusFork >= ConsensusFork.Bellatrix:
+        when consensusFork >= ConsensusFork.Capella:
+          # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/shanghai.md#specification-1
+          # Consensus layer client MUST call this method instead of
+          # `engine_forkchoiceUpdatedV1` under any of the following conditions:
+          # `headBlockHash` references a block which `timestamp` is greater or
+          # equal to the Shanghai timestamp
           if blck.message.is_execution_block:
             template payload(): auto = blck.message.body.execution_payload
 
             if elManager != nil and not payload.block_hash.isZero:
-              discard await elManager.newExecutionPayload(payload)
+              discard await elManager.newExecutionPayload(blck.message.body)
               discard await elManager.forkchoiceUpdated(
                 headBlockHash = payload.block_hash,
                 safeBlockHash = payload.block_hash,  # stub value
                 finalizedBlockHash = ZERO_HASH,
-                payloadAttributes = NoPayloadAttributes)
+                payloadAttributes = none PayloadAttributesV2)
+        elif consensusFork >= ConsensusFork.Bellatrix:
+          if blck.message.is_execution_block:
+            template payload(): auto = blck.message.body.execution_payload
+
+            if elManager != nil and not payload.block_hash.isZero:
+              discard await elManager.newExecutionPayload(blck.message.body)
+              discard await elManager.forkchoiceUpdated(
+                headBlockHash = payload.block_hash,
+                safeBlockHash = payload.block_hash,  # stub value
+                finalizedBlockHash = ZERO_HASH,
+                payloadAttributes = none PayloadAttributesV1)
         else: discard
     optimisticProcessor = initOptimisticProcessor(
       getBeaconTime, optimisticHandler)

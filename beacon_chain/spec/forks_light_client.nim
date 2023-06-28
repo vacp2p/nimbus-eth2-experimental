@@ -816,7 +816,7 @@ func migratingToDataFork*[
   upgradedObject.migrateToDataFork(newKind)
   upgradedObject
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/full-node.md#block_to_light_client_header
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/altair/light-client/full-node.md#block_to_light_client_header
 func toAltairLightClientHeader(
     blck:  # `SomeSignedBeaconBlock` doesn't work here (Nim 1.6)
       phase0.SignedBeaconBlock | phase0.TrustedSignedBeaconBlock |
@@ -826,7 +826,7 @@ func toAltairLightClientHeader(
   altair.LightClientHeader(
     beacon: blck.message.toBeaconBlockHeader())
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/capella/light-client/full-node.md#modified-block_to_light_client_header
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/capella/light-client/full-node.md#modified-block_to_light_client_header
 func toCapellaLightClientHeader(
     blck:  # `SomeSignedBeaconBlock` doesn't work here (Nim 1.6)
       phase0.SignedBeaconBlock | phase0.TrustedSignedBeaconBlock |
@@ -868,7 +868,7 @@ func toCapellaLightClientHeader(
     execution_branch: blck.message.body.build_proof(
       capella.EXECUTION_PAYLOAD_INDEX).get)
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/deneb/light-client/full-node.md#modified-block_to_light_client_header
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.0/specs/deneb/light-client/full-node.md#modified-block_to_light_client_header
 func toDenebLightClientHeader(
     blck:  # `SomeSignedBeaconBlock` doesn't work here (Nim 1.6)
       phase0.SignedBeaconBlock | phase0.TrustedSignedBeaconBlock |
@@ -930,10 +930,10 @@ func toDenebLightClientHeader(
       timestamp: payload.timestamp,
       extra_data: payload.extra_data,
       base_fee_per_gas: payload.base_fee_per_gas,
-      excess_data_gas: payload.excess_data_gas,
       block_hash: payload.block_hash,
       transactions_root: hash_tree_root(payload.transactions),
-      withdrawals_root: hash_tree_root(payload.withdrawals)),
+      withdrawals_root: hash_tree_root(payload.withdrawals),
+      excess_data_gas: payload.excess_data_gas),
     execution_branch: blck.message.body.build_proof(
       capella.EXECUTION_PAYLOAD_INDEX).get)
 
@@ -953,3 +953,37 @@ func toLightClientHeader*(
     blck.toAltairLightClientHeader()
   else:
     static: raiseAssert "Unreachable"
+
+import chronicles
+
+func shortLog*[
+    T:
+      ForkedLightClientHeader |
+      SomeForkedLightClientObject |
+      ForkedLightClientStore](
+    x: T): auto =
+  type ResultType = object
+    case kind: LightClientDataFork
+    of LightClientDataFork.None:
+      discard
+    of LightClientDataFork.Altair:
+      altairData: typeof(x.altairData.shortLog())
+    of LightClientDataFork.Capella:
+      capellaData: typeof(x.capellaData.shortLog())
+    of LightClientDataFork.Deneb:
+      denebData: typeof(x.denebData.shortLog())
+
+  let xKind = x.kind  # Nim 1.6.12: Using `kind: x.kind` inside case is broken
+  case xKind
+  of LightClientDataFork.Deneb:
+    ResultType(kind: xKind, denebData: x.denebData.shortLog())
+  of LightClientDataFork.Capella:
+    ResultType(kind: xKind, capellaData: x.capellaData.shortLog())
+  of LightClientDataFork.Altair:
+    ResultType(kind: xKind, altairData: x.altairData.shortLog())
+  of LightClientDataFork.None:
+    ResultType(kind: xKind)
+
+chronicles.formatIt ForkedLightClientHeader: it.shortLog
+chronicles.formatIt SomeForkedLightClientObject: it.shortLog
+chronicles.formatIt ForkedLightClientStore: it.shortLog

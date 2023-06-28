@@ -278,6 +278,20 @@ template BeaconBlockType*(fork: static ConsensusFork): auto =
 template BeaconBlockBodyType*(fork: static ConsensusFork): auto =
   getSymbolFromForkModule(fork, "BeaconBlockBody")
 
+template SignedBeaconBlock*(kind: static ConsensusFork): auto =
+  when kind == ConsensusFork.Deneb:
+    typedesc[deneb.SignedBeaconBlock]
+  elif kind == ConsensusFork.Capella:
+    typedesc[capella.SignedBeaconBlock]
+  elif kind == ConsensusFork.Bellatrix:
+    typedesc[bellatrix.SignedBeaconBlock]
+  elif kind == ConsensusFork.Altair:
+    typedesc[altair.SignedBeaconBlock]
+  elif kind == ConsensusFork.Phase0:
+    typedesc[phase0.SignedBeaconBlock]
+  else:
+    static: raiseAssert "Unreachable"
+
 template ExecutionPayloadForSigning*(kind: static ConsensusFork): auto =
   when kind == ConsensusFork.Deneb:
     typedesc[deneb.ExecutionPayloadForSigning]
@@ -458,6 +472,9 @@ template toFork*[T:
     phase0.BeaconBlock |
     phase0.SignedBeaconBlock |
     phase0.TrustedBeaconBlock |
+    phase0.BeaconBlockBody |
+    phase0.SigVerifiedBeaconBlockBody |
+    phase0.TrustedBeaconBlockBody |
     phase0.SigVerifiedSignedBeaconBlock |
     phase0.MsgTrustedSignedBeaconBlock |
     phase0.TrustedSignedBeaconBlock](
@@ -470,6 +487,9 @@ template toFork*[T:
     altair.BeaconBlock |
     altair.SignedBeaconBlock |
     altair.TrustedBeaconBlock |
+    altair.BeaconBlockBody |
+    altair.SigVerifiedBeaconBlockBody |
+    altair.TrustedBeaconBlockBody |
     altair.SigVerifiedSignedBeaconBlock |
     altair.MsgTrustedSignedBeaconBlock |
     altair.TrustedSignedBeaconBlock](
@@ -485,6 +505,9 @@ template toFork*[T:
     bellatrix.BeaconBlock |
     bellatrix.SignedBeaconBlock |
     bellatrix.TrustedBeaconBlock |
+    bellatrix.BeaconBlockBody |
+    bellatrix.SigVerifiedBeaconBlockBody |
+    bellatrix.TrustedBeaconBlockBody |
     bellatrix.SigVerifiedSignedBeaconBlock |
     bellatrix.MsgTrustedSignedBeaconBlock |
     bellatrix.TrustedSignedBeaconBlock](
@@ -500,6 +523,9 @@ template toFork*[T:
     capella.BeaconBlock |
     capella.SignedBeaconBlock |
     capella.TrustedBeaconBlock |
+    capella.BeaconBlockBody |
+    capella.SigVerifiedBeaconBlockBody |
+    capella.TrustedBeaconBlockBody |
     capella.SigVerifiedSignedBeaconBlock |
     capella.MsgTrustedSignedBeaconBlock |
     capella.TrustedSignedBeaconBlock](
@@ -515,6 +541,9 @@ template toFork*[T:
     deneb.BeaconBlock |
     deneb.SignedBeaconBlock |
     deneb.TrustedBeaconBlock |
+    deneb.BeaconBlockBody |
+    deneb.SigVerifiedBeaconBlockBody |
+    deneb.TrustedBeaconBlockBody |
     deneb.SigVerifiedSignedBeaconBlock |
     deneb.MsgTrustedSignedBeaconBlock |
     deneb.TrustedSignedBeaconBlock](
@@ -549,6 +578,21 @@ template withState*(x: ForkedHashedBeaconState, body: untyped): untyped =
     template forkyState: untyped {.inject, used.} = x.phase0Data
     body
 
+template forky(
+    x: ForkedHashedBeaconState, kind: static ConsensusFork): untyped =
+  when kind == ConsensusFork.Deneb:
+    x.denebData
+  elif kind == ConsensusFork.Capella:
+    x.capellaData
+  elif kind == ConsensusFork.Bellatrix:
+    x.bellatrixData
+  elif kind == ConsensusFork.Altair:
+    x.altairData
+  elif kind == ConsensusFork.Phase0:
+    x.phase0Data
+  else:
+    static: raiseAssert "Unreachable"
+
 template withEpochInfo*(x: ForkedEpochInfo, body: untyped): untyped =
   case x.kind
   of EpochInfoFork.Phase0:
@@ -578,23 +622,18 @@ template withEpochInfo*(
   template info: untyped {.inject.} = x.altairData
   body
 
+{.push warning[ProveField]:off.}
 func assign*(tgt: var ForkedHashedBeaconState, src: ForkedHashedBeaconState) =
   if tgt.kind == src.kind:
-    case tgt.kind
-    of ConsensusFork.Deneb:
-      assign(tgt.denebData,     src.denebData):
-    of ConsensusFork.Capella:
-      assign(tgt.capellaData,   src.capellaData):
-    of ConsensusFork.Bellatrix:
-      assign(tgt.bellatrixData, src.bellatrixData):
-    of ConsensusFork.Altair:
-      assign(tgt.altairData,    src.altairData):
-    of ConsensusFork.Phase0:
-      assign(tgt.phase0Data,    src.phase0Data):
+    withState(tgt):
+      template forkyTgt: untyped = forkyState
+      template forkySrc: untyped = src.forky(consensusFork)
+      assign(forkyTgt, forkySrc)
   else:
     # Ensure case object and discriminator get updated simultaneously, even
     # with nimOldCaseObjects. This is infrequent.
     tgt = src
+{.pop.}
 
 template getStateField*(x: ForkedHashedBeaconState, y: untyped): untyped =
   # The use of `unsafeAddr` avoids excessive copying in certain situations, e.g.,
@@ -602,18 +641,16 @@ template getStateField*(x: ForkedHashedBeaconState, y: untyped): untyped =
   #   for index, validator in getStateField(stateData.data, validators):
   # ```
   # Without `unsafeAddr`, the `validators` list would be copied to a temporary variable.
-  (case x.kind
-  of ConsensusFork.Deneb:     unsafeAddr x.denebData.data.y
-  of ConsensusFork.Capella:   unsafeAddr x.capellaData.data.y
-  of ConsensusFork.Bellatrix: unsafeAddr x.bellatrixData.data.y
-  of ConsensusFork.Altair:    unsafeAddr x.altairData.data.y
-  of ConsensusFork.Phase0:    unsafeAddr x.phase0Data.data.y)[]
+  (block:
+    withState(x): unsafeAddr forkyState.data.y)[]
 
 func getStateRoot*(x: ForkedHashedBeaconState): Eth2Digest =
   withState(x): forkyState.root
 
+{.push warning[ProveField]:off.}  # https://github.com/nim-lang/Nim/issues/22060
 func setStateRoot*(x: var ForkedHashedBeaconState, root: Eth2Digest) =
   withState(x): forkyState.root = root
+{.pop.}
 
 func consensusForkAtEpoch*(cfg: RuntimeConfig, epoch: Epoch): ConsensusFork =
   ## Return the current fork for the given epoch.
@@ -928,18 +965,22 @@ type
     slot: Slot
 
 func readSszForkedHashedBeaconState*(
-    cfg: RuntimeConfig, slot: Slot, data: openArray[byte]):
+    consensusFork: ConsensusFork, data: openArray[byte]):
     ForkedHashedBeaconState {.raises: [Defect, SszError].} =
   # TODO https://github.com/nim-lang/Nim/issues/19357
-  result = ForkedHashedBeaconState(
-    kind: cfg.consensusForkAtEpoch(slot.epoch()))
+  result = ForkedHashedBeaconState(kind: consensusFork)
 
   withState(result):
     readSszBytes(data, forkyState.data)
     forkyState.root = hash_tree_root(forkyState.data)
 
+template readSszForkedHashedBeaconState*(
+    cfg: RuntimeConfig, slot: Slot, data: openArray[byte]):
+    ForkedHashedBeaconState =
+  cfg.consensusForkAtEpoch(slot.epoch()).readSszForkedHashedBeaconState(data)
+
 func readSszForkedHashedBeaconState*(cfg: RuntimeConfig, data: openArray[byte]):
-    ForkedHashedBeaconState {.raises: [Defect, SszError].} =
+    ForkedHashedBeaconState {.raises: [SerializationError].} =
   ## Read a state picking the right fork by first reading the slot from the byte
   ## source
   if data.len() < sizeof(BeaconStateHeader):
@@ -959,7 +1000,7 @@ type
 
 func readSszForkedSignedBeaconBlock*(
     cfg: RuntimeConfig, data: openArray[byte]):
-    ForkedSignedBeaconBlock {.raises: [Defect, SszError].} =
+    ForkedSignedBeaconBlock {.raises: [SerializationError].} =
   ## Helper to read a header from bytes when it's not certain what kind of block
   ## it is
   if data.len() < sizeof(ForkedBeaconBlockHeader):
@@ -975,7 +1016,7 @@ func readSszForkedSignedBeaconBlock*(
   withBlck(result):
     readSszBytes(data, blck)
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/phase0/beacon-chain.md#compute_fork_data_root
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/beacon-chain.md#compute_fork_data_root
 func compute_fork_data_root*(current_version: Version,
     genesis_validators_root: Eth2Digest): Eth2Digest =
   ## Return the 32-byte fork data root for the ``current_version`` and
@@ -987,7 +1028,7 @@ func compute_fork_data_root*(current_version: Version,
     genesis_validators_root: genesis_validators_root
   ))
 
-# https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/phase0/beacon-chain.md#compute_fork_digest
+# https://github.com/ethereum/consensus-specs/blob/v1.4.0-alpha.3/specs/phase0/beacon-chain.md#compute_fork_digest
 func compute_fork_digest*(current_version: Version,
                           genesis_validators_root: Eth2Digest): ForkDigest =
   ## Return the 4-byte fork digest for the ``current_version`` and
@@ -1025,3 +1066,11 @@ func toBlockId*(blck: ForkedSignedBeaconBlock |
                       ForkedMsgTrustedSignedBeaconBlock |
                       ForkedTrustedSignedBeaconBlock): BlockId =
   withBlck(blck): BlockId(root: blck.root, slot: blck.message.slot)
+
+func historical_summaries*(state: ForkedHashedBeaconState):
+    HashList[HistoricalSummary, Limit HISTORICAL_ROOTS_LIMIT] =
+  withState(state):
+    when consensusFork >= ConsensusFork.Capella:
+      forkyState.data.historical_summaries
+    else:
+      HashList[HistoricalSummary, Limit HISTORICAL_ROOTS_LIMIT]()

@@ -7,7 +7,6 @@
 
 {.push raises: [].}
 
-
 import
   std/[strutils, os, options, unicode, uri],
   metrics,
@@ -22,11 +21,12 @@ import
   eth/common/eth_types as commonEthTypes, eth/net/nat,
   eth/p2p/discoveryv5/enr,
   json_serialization, web3/[ethtypes, confutils_defs],
+  kzg4844/kzg_ex,
   ./spec/[engine_authentication, keystore, network, crypto],
   ./spec/datatypes/base,
   ./networking/network_metadata,
   ./validators/slashing_protection_common,
-  ./eth1/el_conf,
+  ./el/el_conf,
   ./filepath
 
 from consensus_object_pools/block_pools_types_light_client
@@ -115,16 +115,14 @@ type
     # migrateAll = "Export and remove the whole validator slashing protection DB."
     # migrate = "Export and remove specified validators from Nimbus."
 
-  DeploymentPhase* {.pure.} = enum
-    Devnet = "devnet"
-    CapellaReady = "capella"
-    Testnet = "testnet"
-    Mainnet = "mainnet"
-    None = "none"
-
   ImportMethod* {.pure.} = enum
     Normal = "normal"
     SingleSalt = "single-salt"
+
+  BlockMonitoringType* {.pure.} = enum
+    Disabled = "disabled"
+    Poll = "poll"
+    Event = "event"
 
   BeaconNodeConf* = object
     configFile* {.
@@ -144,7 +142,7 @@ type
       name: "log-format" .}: StdoutLogKind
 
     logFile* {.
-      desc: "Specifies a path for the written Json log file (deprecated)"
+      desc: "Specifies a path for the written JSON log file (deprecated)"
       name: "log-file" .}: Option[OutFile]
 
     eth2Network* {.
@@ -205,7 +203,7 @@ type
       name: "require-engine-api-in-bellatrix" .}: Option[bool]
 
     nonInteractive* {.
-      desc: "Do not display interative prompts. Quit on missing configuration"
+      desc: "Do not display interactive prompts. Quit on missing configuration"
       name: "non-interactive" .}: bool
 
     netKeyFile* {.
@@ -240,7 +238,7 @@ type
       desc: "Number of worker threads (\"0\" = use as many threads as there are CPU cores available)"
       name: "num-threads" .}: int
 
-    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.2/src/engine/authentication.md#key-distribution
+    # https://github.com/ethereum/execution-apis/blob/v1.0.0-beta.3/src/engine/authentication.md#key-distribution
     jwtSecret* {.
       desc: "A file containing the hex-encoded 256 bit secret key to be used for verifying/generating JWT tokens"
       name: "jwt-secret" .}: Option[InputFile]
@@ -307,14 +305,19 @@ type
         defaultValue: false
         name: "enr-auto-update" .}: bool
 
+      enableYamux* {.
+        hidden
+        desc: "Enable the Yamux multiplexer"
+        defaultValue: false
+        name: "enable-yamux" .}: bool
+
       weakSubjectivityCheckpoint* {.
         desc: "Weak subjectivity checkpoint in the format block_root:epoch_number"
         name: "weak-subjectivity-checkpoint" .}: Option[Checkpoint]
 
       syncLightClient* {.
-        hidden
-        desc: "Accelerate sync using light client"
-        defaultValue: false
+        desc: "Accelerate execution layer sync using light client"
+        defaultValue: true
         name: "sync-light-client" .}: bool
 
       trustedBlockRoot* {.
@@ -517,12 +520,6 @@ type
         defaultValue: true # the use of the nimbus_signing_process binary by default will be delayed until async I/O over stdin/stdout is developed for the child process.
         name: "in-process-validators" .}: bool
 
-      debugForkChoice* {.
-        hidden
-        desc: "Enable debug API for fork choice (https://github.com/ethereum/beacon-APIs/pull/232)"
-        defaultValue: false
-        name: "debug-fork-choice" .}: bool
-
       discv5Enabled* {.
         desc: "Enable Discovery v5"
         defaultValue: true
@@ -534,7 +531,7 @@ type
         name: "dump" .}: bool
 
       directPeers* {.
-        desc: "The list of priviledged, secure and known peers to connect and maintain the connection to, this requires a not random netkey-file. In the complete multiaddress format like: /ip4/<address>/tcp/<port>/p2p/<peerId-public-key>. Peering agreements are established out of band and must be reciprocal."
+        desc: "The list of privileged, secure and known peers to connect and maintain the connection to, this requires a not random netkey-file. In the complete multiaddress format like: /ip4/<address>/tcp/<port>/p2p/<peerId-public-key>. Peering agreements are established out of band and must be reciprocal."
         name: "direct-peer" .}: seq[string]
 
       doppelgangerDetection* {.
@@ -548,13 +545,6 @@ type
         defaultValue: MaxEmptySlotCount
         defaultValueDesc: "50"
         name: "sync-horizon" .}: uint64
-
-      deploymentPhase* {.
-        hidden
-        desc: "Configures the deployment phase"
-        defaultValue: DeploymentPhase.CapellaReady
-        defaultValueDesc: $DeploymentPhase.CapellaReady
-        name: "deployment-phase" .}: DeploymentPhase
 
       terminalTotalDifficultyOverride* {.
         hidden
@@ -608,10 +598,25 @@ type
         defaultValue: ""
         name: "payload-builder-url" .}: string
 
+      # Flag name and semantics borrowed from Prysm
+      # https://github.com/prysmaticlabs/prysm/pull/12227/files
+      localBlockValueBoost* {.
+        desc: "Increase execution layer block values for builder bid comparison by a percentage"
+        defaultValue: 0
+        name: "local-block-value-boost" .}: uint8
+
       historyMode* {.
         desc: "Retention strategy for historical data (archive/prune)"
-        defaultValue: HistoryMode.Archive
+        defaultValue: HistoryMode.Prune
         name: "history".}: HistoryMode
+
+      # https://notes.ethereum.org/@bbusa/dencun-devnet-6
+      # "Please ensure that there is a way for us to specify the file through a
+      # runtime flag such as --trusted-setup-file (or similar)."
+      trustedSetupFile* {.
+        hidden
+        desc: "Experimental, debug option; could disappear at any time without warning"
+        name: "temporary-debug-trusted-setup-file" .}: Option[string]
 
     of BNStartUpCmd.wallets:
       case walletsCmd* {.command.}: WalletsCmd
@@ -697,12 +702,19 @@ type
           name: "method" .}: ImportMethod
 
       of DepositsCmd.exit:
-        exitedValidator* {.
-          name: "validator"
-          desc: "Validator index, public key or a keystore path of the exited validator" .}: string
+        exitedValidators* {.
+          desc: "One or more validator index, public key or a keystore path of " &
+                "the exited validator(s)"
+          name: "validator" .}: seq[string]
+
+        exitAllValidatorsFlag* {.
+          desc: "Exit all validators in the specified data directory or validators directory"
+          defaultValue: false
+          name: "all" .}: bool
 
         exitAtEpoch* {.
           name: "epoch"
+          defaultValueDesc: "immediately"
           desc: "The desired exit epoch" .}: Option[uint64]
 
         restUrlForExit* {.
@@ -780,14 +792,17 @@ type
 
       stateId* {.
         desc: "State id to sync to - this can be \"finalized\", a slot number or state hash or \"head\""
-        defaultValue: "finalized",
         name: "state-id"
-      .}: string
+      .}: Option[string]
 
       blockId* {.
         hidden
         desc: "Block id to sync to - this can be a block root, slot number, \"finalized\" or \"head\" (deprecated)"
       .}: Option[string]
+
+      lcTrustedBlockRoot* {.
+        desc: "Recent trusted finalized block root to initialize light client from"
+        name: "trusted-block-root" .}: Option[Eth2Digest]
 
       backfillBlocks* {.
         desc: "Backfill blocks directly from REST server instead of fetching via API"
@@ -821,7 +836,7 @@ type
       name: "log-format" .}: StdoutLogKind
 
     logFile* {.
-      desc: "Specifies a path for the written Json log file (deprecated)"
+      desc: "Specifies a path for the written JSON log file (deprecated)"
       name: "log-file" .}: Option[OutFile]
 
     dataDir* {.
@@ -843,7 +858,7 @@ type
       name: "doppelganger-detection" .}: bool
 
     nonInteractive* {.
-      desc: "Do not display interative prompts. Quit on missing configuration"
+      desc: "Do not display interactive prompts. Quit on missing configuration"
       name: "non-interactive" .}: bool
 
     validatorsDirFlag* {.
@@ -947,6 +962,11 @@ type
       defaultValueDesc: $defaultBeaconNodeUri
       name: "beacon-node" .}: seq[Uri]
 
+    monitoringType* {.
+      desc: "Enable block monitoring which are seen by beacon node (BETA)"
+      defaultValue: BlockMonitoringType.Disabled
+      name: "block-monitor-type".}: BlockMonitoringType
+
   SigningNodeConf* = object
     configFile* {.
       desc: "Loads the configuration from a TOML file"
@@ -964,11 +984,11 @@ type
       name: "log-stdout" .}: StdoutLogKind
 
     logFile* {.
-      desc: "Specifies a path for the written Json log file"
+      desc: "Specifies a path for the written JSON log file"
       name: "log-file" .}: Option[OutFile]
 
     nonInteractive* {.
-      desc: "Do not display interative prompts. Quit on missing configuration"
+      desc: "Do not display interactive prompts. Quit on missing configuration"
       name: "non-interactive" .}: bool
 
     dataDir* {.
@@ -985,6 +1005,11 @@ type
     secretsDirFlag* {.
       desc: "A directory containing validator keystore passwords"
       name: "secrets-dir" .}: Option[InputDir]
+
+    expectedFeeRecipient* {.
+      desc: "Signatures for blocks will require proofs of the specified " &
+            "fee recipient"
+      name: "expected-fee-recipient".}: Option[Address]
 
     serverIdent* {.
       desc: "Server identifier which will be used in HTTP Host header"
@@ -1145,10 +1170,9 @@ func parseCmdArg*(T: type WalletName, input: string): T
 func completeCmdArg*(T: type WalletName, input: string): seq[string] =
   return @[]
 
-proc parseCmdArg*(T: type enr.Record, p: string): T
-    {.raises: [ConfigurationError, Defect].} =
+proc parseCmdArg*(T: type enr.Record, p: string): T {.raises: [ValueError].} =
   if not fromURI(result, p):
-    raise newException(ConfigurationError, "Invalid ENR")
+    raise newException(ValueError, "Invalid ENR")
 
 func completeCmdArg*(T: type enr.Record, val: string): seq[string] =
   return @[]
@@ -1294,9 +1318,9 @@ proc loadEth2Network*(
     getMetadataForNetwork(eth2Network.get)
   else:
     when const_preset == "gnosis":
-      gnosisMetadata
+      getMetadataForNetwork("gnosis")
     elif const_preset == "mainnet":
-      mainnetMetadata
+      getMetadataForNetwork("mainnet")
     else:
       # Presumably other configurations can have other defaults, but for now
       # this simplifies the flow
@@ -1306,12 +1330,12 @@ proc loadEth2Network*(
 template loadEth2Network*(config: BeaconNodeConf): Eth2NetworkMetadata =
   loadEth2Network(config.eth2Network)
 
-func defaultFeeRecipient*(conf: AnyConf): Eth1Address =
+func defaultFeeRecipient*(conf: AnyConf): Opt[Eth1Address] =
   if conf.suggestedFeeRecipient.isSome:
-    conf.suggestedFeeRecipient.get
+    Opt.some conf.suggestedFeeRecipient.get
   else:
     # https://github.com/nim-lang/Nim/issues/19802
-    (static(default(Eth1Address)))
+    (static(Opt.none Eth1Address))
 
 proc loadJwtSecret*(
     rng: var HmacDrbgContext,
@@ -1346,3 +1370,26 @@ proc engineApiUrls*(config: BeaconNodeConf): seq[EngineApiUrl] =
     config.elUrls
 
   (elUrls & config.web3Urls).toFinalEngineApiUrls(config.jwtSecret)
+
+proc loadKzgTrustedSetup*(): Result[void, string] =
+  const
+    vendorDir = currentSourcePath.parentDir.replace('\\', '/') & "/../vendor"
+    trustedSetupDir = vendorDir & "/nim-kzg4844/kzg4844/csources/src"
+
+  const trustedSetup =
+    when const_preset == "mainnet":
+      staticRead trustedSetupDir & "/trusted_setup.txt"
+    elif const_preset == "minimal":
+      staticRead trustedSetupDir & "/trusted_setup_4.txt"
+    else:
+      ""
+  if const_preset == "mainnet" or const_preset == "minimal":
+    Kzg.loadTrustedSetupFromString(trustedSetup)
+  else:
+    ok()
+
+proc loadKzgTrustedSetup*(trustedSetupPath: string): Result[void, string] =
+  try:
+    Kzg.loadTrustedSetupFromString(readFile(trustedSetupPath))
+  except IOError as err:
+    err(err.msg)

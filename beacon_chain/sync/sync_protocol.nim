@@ -22,13 +22,8 @@ logScope:
   topics = "sync"
 
 const
-  MAX_REQUEST_BLOCKS* = 1024
-  MAX_REQUEST_BLOBS_SIDECARS* = 128
-
   blockResponseCost = allowedOpsPerSecondCost(64) # Allow syncing ~64 blocks/sec (minus request costs)
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/p2p-interface.md#configuration
-  MAX_REQUEST_LIGHT_CLIENT_UPDATES* = 128
   lightClientBootstrapResponseCost = allowedOpsPerSecondCost(1)
     ## Only one bootstrap per peer should ever be needed - no need to allow more
   lightClientUpdateResponseCost = allowedOpsPerSecondCost(1000)
@@ -71,7 +66,7 @@ type
     slot: Slot
 
   BlockRootsList* = List[Eth2Digest, Limit MAX_REQUEST_BLOCKS]
-  BlobIdentifierList* = List[BlobIdentifier, Limit (MAX_REQUEST_BLOBS_SIDECARS * MAX_BLOBS_PER_BLOCK)]
+  BlobIdentifierList* = List[BlobIdentifier, Limit (MAX_REQUEST_BLOB_SIDECARS)]
 
 template readChunkPayload*(
     conn: Connection, peer: Peer, MsgType: type ForkySignedBeaconBlock):
@@ -288,7 +283,7 @@ p2pProtocol BeaconSync(version = 1,
     {.libp2pProtocol("ping", 1, isRequired = true).} =
     return peer.network.metadata.seq_number
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/p2p-interface.md#transitioning-from-v1-to-v2
+  # https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/altair/p2p-interface.md#transitioning-from-v1-to-v2
   proc getMetaData(peer: Peer): uint64
     {.libp2pProtocol("metadata", 1, isRequired = true).} =
     raise newException(InvalidInputsError, "GetMetaData v1 unsupported")
@@ -345,7 +340,7 @@ p2pProtocol BeaconSync(version = 1,
         # blocks all being optimistic and none of them being optimistic. The
         # EL catches up, tells the CL the head is verified, and that's it.
         if  blocks[i].slot.epoch >= dag.cfg.BELLATRIX_FORK_EPOCH and
-            dag.is_optimistic(dag.head.root):
+            not dag.head.executionValid:
           continue
 
         let uncompressedLen = uncompressedLenFramed(bytes).valueOr:
@@ -407,7 +402,7 @@ p2pProtocol BeaconSync(version = 1,
         # blocks all being optimistic and none of them being optimistic. The
         # EL catches up, tells the CL the head is verified, and that's it.
         if  blockRef.slot.epoch >= dag.cfg.BELLATRIX_FORK_EPOCH and
-            dag.is_optimistic(dag.head.root):
+            not dag.head.executionValid:
           continue
 
         let uncompressedLen = uncompressedLenFramed(bytes).valueOr:
@@ -429,12 +424,12 @@ p2pProtocol BeaconSync(version = 1,
       peer, roots = blockRoots.len, count, found
 
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.3/specs/deneb/p2p-interface.md#blobsidecarsbyroot-v1
+  # https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/deneb/p2p-interface.md#blobsidecarsbyroot-v1
   proc blobSidecarsByRoot(
       peer: Peer,
       blobIds: BlobIdentifierList,
       response: MultipleChunksResponse[
-        ref BlobSidecar, Limit(MAX_REQUEST_BLOBS_SIDECARS * MAX_BLOBS_PER_BLOCK)])
+        ref BlobSidecar, Limit(MAX_REQUEST_BLOB_SIDECARS)])
       {.async, libp2pProtocol("blob_sidecars_by_root", 1).} =
     # TODO Semantically, this request should return a non-ref, but doing so
     #      runs into extreme inefficiency due to the compiler introducing
@@ -481,12 +476,13 @@ p2pProtocol BeaconSync(version = 1,
     debug "Blob root request done",
       peer, roots = blobIds.len, count, found
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.3/specs/deneb/p2p-interface.md#blobsidecarsbyrange-v1
+  # https://github.com/ethereum/consensus-specs/blob/v1.3.0/specs/deneb/p2p-interface.md#blobsidecarsbyrange-v1
   proc blobSidecarsByRange(
       peer: Peer,
       startSlot: Slot,
       reqCount: uint64,
-      response: MultipleChunksResponse[ref BlobSidecar, Limit(MAX_REQUEST_BLOBS_SIDECARS * MAX_BLOBS_PER_BLOCK)])
+      response: MultipleChunksResponse[
+        ref BlobSidecar, Limit(MAX_REQUEST_BLOB_SIDECARS)])
       {.async, libp2pProtocol("blob_sidecars_by_range", 1).} =
     # TODO This code is more complicated than it needs to be, since the type
     #      of the multiple chunks response is not actually used in this server
@@ -512,7 +508,7 @@ p2pProtocol BeaconSync(version = 1,
     if startSlot.epoch < epochBoundary:
       raise newException(ResourceUnavailableError, BlobsOutOfRange)
 
-    var blockIds: array[MAX_REQUEST_BLOBS_SIDECARS, BlockId]
+    var blockIds: array[int(MAX_REQUEST_BLOB_SIDECARS), BlockId]
     let
       count = int min(reqCount, blockIds.lenu64)
       endIndex = count - 1
@@ -530,7 +526,7 @@ p2pProtocol BeaconSync(version = 1,
           # blocks all being optimistic and none of them being optimistic. The
           # EL catches up, tells the CL the head is verified, and that's it.
           if  blockIds[i].slot.epoch >= dag.cfg.BELLATRIX_FORK_EPOCH and
-              dag.is_optimistic(dag.head.root):
+              not dag.head.executionValid:
             continue
 
           let uncompressedLen = uncompressedLenFramed(bytes).valueOr:
@@ -550,9 +546,9 @@ p2pProtocol BeaconSync(version = 1,
           break
 
     debug "BlobSidecar range request done",
-      peer, startSlot, found
+      peer, startSlot, count = reqCount, found
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/p2p-interface.md#getlightclientbootstrap
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/altair/light-client/p2p-interface.md#getlightclientbootstrap
   proc lightClientBootstrap(
       peer: Peer,
       blockRoot: Eth2Digest,
@@ -580,7 +576,7 @@ p2pProtocol BeaconSync(version = 1,
 
     debug "LC bootstrap request done", peer, blockRoot
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/p2p-interface.md#lightclientupdatesbyrange
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/altair/light-client/p2p-interface.md#lightclientupdatesbyrange
   proc lightClientUpdatesByRange(
       peer: Peer,
       startPeriod: SyncCommitteePeriod,
@@ -625,7 +621,7 @@ p2pProtocol BeaconSync(version = 1,
 
     debug "LC updates by range request done", peer, startPeriod, count, found
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/p2p-interface.md#getlightclientfinalityupdate
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/altair/light-client/p2p-interface.md#getlightclientfinalityupdate
   proc lightClientFinalityUpdate(
       peer: Peer,
       response: SingleChunkResponse[ForkedLightClientFinalityUpdate])
@@ -652,7 +648,7 @@ p2pProtocol BeaconSync(version = 1,
 
     debug "LC finality update request done", peer
 
-  # https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/specs/altair/light-client/p2p-interface.md#getlightclientoptimisticupdate
+  # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/altair/light-client/p2p-interface.md#getlightclientoptimisticupdate
   proc lightClientOptimisticUpdate(
       peer: Peer,
       response: SingleChunkResponse[ForkedLightClientOptimisticUpdate])

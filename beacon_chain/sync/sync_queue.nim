@@ -25,12 +25,8 @@ logScope:
 type
   GetSlotCallback* = proc(): Slot {.gcsafe, raises: [Defect].}
   ProcessingCallback* = proc() {.gcsafe, raises: [Defect].}
-  BlockVerifier* =
-    proc(signedBlock: ForkedSignedBeaconBlock, maybeFinalized: bool):
-      Future[Result[void, VerifierError]] {.gcsafe, raises: [Defect].}
-  BlockBlobsVerifier* =
-    proc(signedBlock: ForkedSignedBeaconBlock, blobs: BlobSidecars,
-         maybeFinalized: bool):
+  BlockVerifier* =  proc(signedBlock: ForkedSignedBeaconBlock,
+                         blobs: Opt[BlobSidecars], maybeFinalized: bool):
       Future[Result[void, VerifierError]] {.gcsafe, raises: [Defect].}
 
   SyncQueueKind* {.pure.} = enum
@@ -79,7 +75,6 @@ type
     readyQueue: HeapQueue[SyncResult[T]]
     rewind: Option[RewindPoint]
     blockVerifier: BlockVerifier
-    blockBlobsVerifier: BlockBlobsVerifier
     ident*: string
 
 chronicles.formatIt SyncQueueKind: toLowerAscii($it)
@@ -121,14 +116,17 @@ proc getShortMap*[T](req: SyncRequest[T],
   var res = newStringOfCap(req.count * MAX_BLOBS_PER_BLOCK)
   var cur : uint64 = 0
   for slot in req.slot..<req.slot+req.count:
+    if cur >= lenu64(data):
+      res.add('|')
+      continue
     if slot == data[cur].slot:
       for k in cur..<cur+MAX_BLOBS_PER_BLOCK:
-        inc(cur)
-        if slot == data[k].slot:
-          res.add('x')
-        else:
+        if k >= lenu64(data) or slot != data[k].slot:
           res.add('|')
           break
+        else:
+          inc(cur)
+          res.add('x')
     else:
       res.add('|')
   res
@@ -198,7 +196,6 @@ proc init*[T](t1: typedesc[SyncQueue], t2: typedesc[T],
               start, final: Slot, chunkSize: uint64,
               getSafeSlotCb: GetSlotCallback,
               blockVerifier: BlockVerifier,
-              blockBlobsVerifier: BlockBlobsVerifier,
               syncQueueSize: int = -1,
               ident: string = "main"): SyncQueue[T] =
   ## Create new synchronization queue with parameters
@@ -270,7 +267,6 @@ proc init*[T](t1: typedesc[SyncQueue], t2: typedesc[T],
     inpSlot: start,
     outSlot: start,
     blockVerifier: blockVerifier,
-    blockBlobsVerifier: blockBlobsVerifier,
     ident: ident
   )
 
@@ -542,15 +538,23 @@ proc getRewindPoint*[T](sq: SyncQueue[T], failSlot: Slot,
            safe_slot = safeSlot, fail_slot = failSlot
     safeSlot
 
-iterator blocks*[T](sq: SyncQueue[T],
-                    sr: SyncResult[T]): ref ForkedSignedBeaconBlock =
+# This belongs inside the blocks iterator below, but can't be there due to
+# https://github.com/nim-lang/Nim/issues/21242
+func getOpt(blobs: Opt[seq[BlobSidecars]], i: int): Opt[BlobSidecars] =
+  if blobs.isSome:
+    Opt.some(blobs.get()[i])
+  else:
+    Opt.none(BlobSidecars)
+
+iterator blocks[T](sq: SyncQueue[T],
+                   sr: SyncResult[T]): (ref ForkedSignedBeaconBlock, Opt[BlobSidecars]) =
   case sq.kind
   of SyncQueueKind.Forward:
     for i in countup(0, len(sr.data) - 1):
-      yield sr.data[i]
+      yield (sr.data[i], sr.blobs.getOpt(i))
   of SyncQueueKind.Backward:
     for i in countdown(len(sr.data) - 1, 0):
-      yield sr.data[i]
+      yield (sr.data[i], sr.blobs.getOpt(i))
 
 proc advanceOutput*[T](sq: SyncQueue[T], number: uint64) =
   case sq.kind
@@ -682,11 +686,8 @@ proc push*[T](sq: SyncQueue[T], sr: SyncRequest[T],
       res: Result[void, VerifierError]
 
     var i=0
-    for blk in sq.blocks(item):
-      if reqres.get().blobs.isNone():
-        res = await sq.blockVerifier(blk[], maybeFinalized)
-      else:
-        res = await sq.blockBlobsVerifier(blk[], reqres.get().blobs.get()[i], maybeFinalized)
+    for blk, blb in sq.blocks(item):
+      res = await sq.blockVerifier(blk[], blb, maybeFinalized)
       inc(i)
 
       if res.isOk():

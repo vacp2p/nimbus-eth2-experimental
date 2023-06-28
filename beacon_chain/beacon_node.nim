@@ -17,10 +17,10 @@ import
   "."/[beacon_clock, beacon_chain_db, conf, light_client],
   ./gossip_processing/[eth2_processor, block_processor, optimistic_processor],
   ./networking/eth2_network,
-  ./eth1/eth1_monitor,
+  ./el/el_manager,
   ./consensus_object_pools/[
-    blockchain_dag, block_quarantine, consensus_manager, exit_pool,
-    attestation_pool, sync_committee_msg_pool],
+    blockchain_dag, blob_quarantine, block_quarantine, consensus_manager,
+    exit_pool, attestation_pool, sync_committee_msg_pool],
   ./spec/datatypes/[base, altair],
   ./spec/eth2_apis/dynamic_fee_recipients,
   ./sync/[sync_manager, request_manager],
@@ -33,7 +33,7 @@ export
   osproc, chronos, httpserver, presto, action_tracker,
   beacon_clock, beacon_chain_db, conf, light_client,
   attestation_pool, sync_committee_msg_pool, validator_pool,
-  eth2_network, eth1_monitor, request_manager, sync_manager,
+  eth2_network, el_manager, request_manager, sync_manager,
   eth2_processor, optimistic_processor, blockchain_dag, block_quarantine,
   base, exit_pool,  message_router, validator_monitor,
   consensus_manager, dynamic_fee_recipients
@@ -64,12 +64,12 @@ type
     lightClient*: LightClient
     dag*: ChainDAGRef
     quarantine*: ref Quarantine
+    blobQuarantine*: ref BlobQuarantine
     attestationPool*: ref AttestationPool
     syncCommitteeMsgPool*: ref SyncCommitteeMsgPool
     lightClientPool*: ref LightClientPool
     validatorChangePool*: ref ValidatorChangePool
     elManager*: ELManager
-    payloadBuilderRestClient*: RestClientRef
     restServer*: RestServerRef
     keymanagerHost*: ref KeymanagerHost
     keymanagerServer*: RestServerRef
@@ -96,6 +96,7 @@ type
       Table[ValidatorPubKey, SignedValidatorRegistrationV1]
     dutyValidatorCount*: int
       ## Number of validators that we've checked for activation
+    processingDelay*: Opt[Duration]
 
 const
   MaxEmptySlotCount* = uint64(10*60) div SECONDS_PER_SLOT
@@ -114,3 +115,35 @@ template rng*(node: BeaconNode): ref HmacDrbgContext =
 
 proc currentSlot*(node: BeaconNode): Slot =
   node.beaconClock.now.slotOrZero
+
+func getPayloadBuilderAddress*(config: BeaconNodeConf): Opt[string] =
+  if config.payloadBuilderEnable:
+    Opt.some config.payloadBuilderUrl
+  else:
+    Opt.none(string)
+
+proc getPayloadBuilderClient*(
+    node: BeaconNode, validator_index: uint64): RestResult[RestClientRef] =
+  if not node.config.payloadBuilderEnable:
+    return err "Payload builder globally disabled"
+
+  let
+    defaultPayloadBuilderAddress = node.config.getPayloadBuilderAddress
+    pubkey = withState(node.dag.headState):
+      if validator_index >= forkyState.data.validators.lenu64:
+        return err "Validator index too high"
+      forkyState.data.validators.item(validator_index).pubkey
+    payloadBuilderAddress =
+      if node.keyManagerHost.isNil:
+        defaultPayloadBuilderAddress
+      else:
+        node.keyManagerHost[].getBuilderConfig(pubkey).valueOr:
+          defaultPayloadBuilderAddress
+
+  if payloadBuilderAddress.isNone:
+    return err "Payload builder disabled"
+  let res = RestClientRef.new(payloadBuilderAddress.get)
+  if res.isOk and res.get.isNil:
+    err "Got nil payload builder REST client reference"
+  else:
+    res

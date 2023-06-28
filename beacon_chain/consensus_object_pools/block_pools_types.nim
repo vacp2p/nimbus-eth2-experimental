@@ -175,6 +175,12 @@ type
       ## The last prune point
       ## We can prune up to finalizedHead
 
+    lastHistoryPruneHorizon*: Slot
+      ## The horizon when we last pruned, for horizon diff computation
+
+    lastHistoryPruneBlockHorizon*: Slot
+      ## Block pruning progress at the last call
+
     # -----------------------------------
     # Rewinder - Mutable state processing
 
@@ -234,9 +240,6 @@ type
       ## EPOCHS_PER_SYNC_COMMITTEE_PERIOD is happening, some valid sync
       ## committee messages will be rejected
 
-    optimisticRoots*: HashSet[Eth2Digest]
-      ## https://github.com/ethereum/consensus-specs/blob/v1.3.0-rc.5/sync/optimistic.md#helpers
-
   EpochKey* = object
     ## The epoch key fully determines the shuffling for proposers and
     ## committees in a beacon state - the epoch level information in the state
@@ -276,43 +279,14 @@ type
     # balances, as used in fork choice
     effective_balances_bytes*: seq[byte]
 
-  # TODO when Nim 1.2 support is dropped, make these generic. 1.2 generates
-  # invalid C code, which gcc refuses to compile. Example test case:
-  # type
-  #   OnBlockAdded[T] = proc(x: T)
-  #   OnPhase0BlockAdded = OnBlockAdded[int]
-  # proc f(x: OnPhase0BlockAdded) = discard
-  # const nilCallback = OnPhase0BlockAdded(nil)
-  # f(nilCallback)
-  OnPhase0BlockAdded* = proc(
-    blckRef: BlockRef,
-    blck: phase0.TrustedSignedBeaconBlock,
-    epochRef: EpochRef,
+  OnBlockAdded[T] = proc(
+    blckRef: BlockRef, blck: T, epochRef: EpochRef,
     unrealized: FinalityCheckpoints) {.gcsafe, raises: [Defect].}
-
-  OnAltairBlockAdded* = proc(
-    blckRef: BlockRef,
-    blck: altair.TrustedSignedBeaconBlock,
-    epochRef: EpochRef,
-    unrealized: FinalityCheckpoints) {.gcsafe, raises: [Defect].}
-
-  OnBellatrixBlockAdded* = proc(
-    blckRef: BlockRef,
-    blck: bellatrix.TrustedSignedBeaconBlock,
-    epochRef: EpochRef,
-    unrealized: FinalityCheckpoints) {.gcsafe, raises: [Defect].}
-
-  OnCapellaBlockAdded* = proc(
-    blckRef: BlockRef,
-    blck: capella.TrustedSignedBeaconBlock,
-    epochRef: EpochRef,
-    unrealized: FinalityCheckpoints) {.gcsafe, raises: [Defect].}
-
-  OnDenebBlockAdded* = proc(
-    blckRef: BlockRef,
-    blck: deneb.TrustedSignedBeaconBlock,
-    epochRef: EpochRef,
-    unrealized: FinalityCheckpoints) {.gcsafe, raises: [Defect].}
+  OnPhase0BlockAdded* = OnBlockAdded[phase0.TrustedSignedBeaconBlock]
+  OnAltairBlockAdded* = OnBlockAdded[altair.TrustedSignedBeaconBlock]
+  OnBellatrixBlockAdded* = OnBlockAdded[bellatrix.TrustedSignedBeaconBlock]
+  OnCapellaBlockAdded* = OnBlockAdded[capella.TrustedSignedBeaconBlock]
+  OnDenebBlockAdded* = OnBlockAdded[deneb.TrustedSignedBeaconBlock]
 
   OnForkyBlockAdded* =
     OnPhase0BlockAdded | OnAltairBlockAdded | OnBellatrixBlockAdded |
@@ -346,6 +320,12 @@ type
     slot*: Slot
     block_root* {.serializedFieldName: "block".}: Eth2Digest
     optimistic* {.serializedFieldName: "execution_optimistic".}: Option[bool]
+
+func proposer_dependent_slot*(epochRef: EpochRef): Slot =
+  epochRef.key.epoch.proposer_dependent_slot()
+
+func attester_dependent_slot*(shufflingRef: ShufflingRef): Slot =
+  shufflingRef.epoch.attester_dependent_slot()
 
 template head*(dag: ChainDAGRef): BlockRef = dag.headState.blck
 

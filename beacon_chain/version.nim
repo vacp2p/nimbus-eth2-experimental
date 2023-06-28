@@ -11,14 +11,14 @@
 
 import std/[strutils, compilesettings]
 
-when not defined(nimscript):
-  import times
-  let copyrights* = "Copyright (c) 2019-" & $(now().utc.year) & " Status Research & Development GmbH"
-
 const
+  compileYear = CompileDate[0 ..< 4]  # YYYY-MM-DD (UTC)
+  copyrights* =
+    "Copyright (c) 2019-" & compileYear & " Status Research & Development GmbH"
+
   versionMajor* = 23
-  versionMinor* = 3
-  versionBuild* = 2
+  versionMinor* = 6
+  versionBuild* = 1
 
   versionBlob* = "stateofus" # Single word - ends up in the default graffiti
 

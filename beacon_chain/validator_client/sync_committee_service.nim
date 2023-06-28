@@ -1,5 +1,5 @@
 # beacon_chain
-# Copyright (c) 2022 Status Research & Development GmbH
+# Copyright (c) 2022-2023 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -11,7 +11,7 @@ import
   ../spec/datatypes/[phase0, altair, bellatrix],
   ../spec/eth2_apis/rest_types,
   ../validators/activity_metrics,
-  "."/[common, api, block_service]
+  "."/[common, api]
 
 const
   ServiceName = "sync_committee_service"
@@ -122,7 +122,7 @@ proc produceAndPublishSyncCommitteeMessages(service: SyncCommitteeServiceRef,
         raise exc
 
       for future in pendingSyncCommitteeMessages:
-        if future.done():
+        if future.completed():
           if future.read():
             inc(succeed)
           else:
@@ -246,7 +246,7 @@ proc produceAndPublishContributions(service: SyncCommitteeServiceRef,
   let validatorContributions = block:
     var res: seq[ContributionItem]
     for idx, fut in slotSignatureReqs:
-      if fut.done:
+      if fut.completed():
         let
           sigRes = fut.read
           validator = validators[idx][0]
@@ -316,7 +316,7 @@ proc produceAndPublishContributions(service: SyncCommitteeServiceRef,
           raise err
 
         for future in pendingAggregates:
-          if future.done():
+          if future.completed():
             if future.read():
               inc(succeed)
             else:
@@ -340,7 +340,7 @@ proc publishSyncMessagesAndContributions(service: SyncCommitteeServiceRef,
      async.} =
   let vc = service.client
 
-  await vc.waitForBlockPublished(slot, syncCommitteeMessageSlotOffset)
+  await vc.waitForBlock(slot, syncCommitteeMessageSlotOffset)
 
   block:
     let delay = vc.getDelay(slot.sync_committee_message_deadline())
@@ -360,8 +360,7 @@ proc publishSyncMessagesAndContributions(service: SyncCommitteeServiceRef,
           res.data.root
         else:
           if res.execution_optimistic.get():
-            notice "Execution client not in sync; skipping validator duties " &
-                   "for now", slot = slot
+            notice "Execution client not in sync", slot = slot
             return
           res.data.root
       except ValidatorApiError as exc:
@@ -406,36 +405,68 @@ proc publishSyncMessagesAndContributions(service: SyncCommitteeServiceRef,
     debug "Producing contribution and proofs", delay = delay
   await service.produceAndPublishContributions(slot, beaconBlockRoot, duties)
 
-proc spawnSyncCommitteeTasks(service: SyncCommitteeServiceRef, slot: Slot) =
+proc processSyncCommitteeTasks(service: SyncCommitteeServiceRef,
+                             slot: Slot) {.async.} =
   let
     vc = service.client
     duties = vc.getSyncCommitteeDutiesForSlot(slot + 1)
+    timeout = vc.beaconClock.durationToNextSlot()
 
-  asyncSpawn service.publishSyncMessagesAndContributions(slot, duties)
+  try:
+    await service.publishSyncMessagesAndContributions(slot,
+                                                      duties).wait(timeout)
+  except AsyncTimeoutError:
+    warn "Unable to publish sync committee messages and contributions in time",
+         slot = slot, timeout = timeout
+  except CancelledError as exc:
+    debug "Sync committee publish task has been interrupted"
+    raise exc
+  except CatchableError as exc:
+    error "Unexpected error encountered while processing sync committee tasks",
+          error_name = exc.name, error_message = exc.msg
 
 proc mainLoop(service: SyncCommitteeServiceRef) {.async.} =
   let vc = service.client
   service.state = ServiceState.Running
   debug "Service started"
 
-  debug "Sync committee duties loop waiting for fork schedule update"
-  await vc.forksAvailable.wait()
+  debug "Sync committee processing loop is waiting for initialization"
+  try:
+    await allFutures(
+      vc.preGenesisEvent.wait(),
+      vc.genesisEvent.wait(),
+      vc.indicesAvailable.wait(),
+      vc.forksAvailable.wait()
+    )
+  except CancelledError:
+    debug "Service interrupted"
+    return
+  except CatchableError as exc:
+    warn "Service crashed with unexpected error", err_name = exc.name,
+         err_msg = exc.msg
+    return
 
+  doAssert(len(vc.forks) > 0, "Fork schedule must not be empty at this point")
+
+  var currentSlot: Opt[Slot]
   while true:
     # This loop could look much more nicer/better, when
     # https://github.com/nim-lang/Nim/issues/19911 will be fixed, so it could
     # become safe to combine loops, breaks and exception handlers.
     let breakLoop =
       try:
-        let sleepTime =
-          syncCommitteeMessageSlotOffset + vc.beaconClock.durationToNextSlot()
-
-        let sres = vc.getCurrentSlot()
-        if sres.isSome():
-          let currentSlot = sres.get()
-          service.spawnSyncCommitteeTasks(currentSlot)
-        await sleepAsync(sleepTime)
-        false
+        let
+          # We use zero offset here, because we do waiting in
+          # waitForBlock(syncCommitteeMessageSlotOffset).
+          slot = await vc.checkedWaitForNextSlot(currentSlot, ZeroTimeDiff,
+                                                 false)
+        if slot.isNone():
+          debug "System time adjusted backwards significantly, exiting"
+          true
+        else:
+          currentSlot = slot
+          await service.processSyncCommitteeTasks(currentSlot.get())
+          false
       except CancelledError:
         debug "Service interrupted"
         true

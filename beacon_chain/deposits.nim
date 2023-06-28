@@ -80,8 +80,8 @@ proc getSignedExitMessage(
 
 type
   ClientExitAction = enum
-    quiting = "q"
-    confirmation = "I understand the implications of submitting a voluntary exit"
+    abort = "q"
+    confirm = "I understand the implications of submitting a voluntary exit"
 
 proc askForExitConfirmation(): ClientExitAction =
   template ask(prompt: string): string =
@@ -97,16 +97,6 @@ proc askForExitConfirmation(): ClientExitAction =
   echoP "Publishing a voluntary exit is an irreversible operation! " &
         "You won't be able to restart again with the same validator."
 
-  echoP "By requesting an exit now, you'll be exempt from penalties " &
-        "stemming from not performing your validator duties, but you " &
-        "won't be able to withdraw your deposited funds for the time " &
-        "being. This means that your funds will be effectively frozen " &
-        "until withdrawals are enabled in a future phase of Eth2."
-
-  echoP "To understand more about the Eth2 roadmap, we recommend you " &
-        "have a look at\n" &
-        "https://ethereum.org/en/eth2/#roadmap"
-
   echoP "You must keep your validator running for at least 5 epochs " &
         "(32 minutes) after requesting a validator exit, as you will " &
         "still be required to perform validator duties until your exit " &
@@ -118,27 +108,28 @@ proc askForExitConfirmation(): ClientExitAction =
 
   var choice = ""
 
-  while not(choice == $ClientExitAction.confirmation or
-            choice == $ClientExitAction.quiting) :
+  while not(choice == $ClientExitAction.confirm or
+            choice == $ClientExitAction.abort) :
     echoP "To proceed to submitting your voluntary exit, please type '" &
-          $ClientExitAction.confirmation &
+          $ClientExitAction.confirm &
           "' (without the quotes) in the prompt below and " &
           "press ENTER or type 'q' to quit."
     echo ""
 
     choice = ask "Your choice"
 
-  if choice == $ClientExitAction.confirmation:
-    ClientExitAction.confirmation
+  if choice == $ClientExitAction.confirm:
+    ClientExitAction.confirm
   else:
-    ClientExitAction.quiting
+    ClientExitAction.abort
 
-proc getValidator*(name: string): Result[ValidatorStorage, string] =
+proc getValidator*(decryptor: var MultipleKeystoresDecryptor,
+                   name: string): Result[ValidatorStorage, string] =
   let ident = ValidatorIdent.decodeString(name)
   if ident.isErr():
     if not(isFile(name)):
       return err($ident.error)
-    let key = importKeystoreFromFile(name)
+    let key = decryptor.importKeystoreFromFile(name)
     if key.isErr():
       return err(key.error())
     ok(ValidatorStorage(kind: ValidatorStorageKind.Keystore,
@@ -147,7 +138,7 @@ proc getValidator*(name: string): Result[ValidatorStorage, string] =
     ok(ValidatorStorage(kind: ValidatorStorageKind.Identifier,
                         ident: ident.get()))
 
-proc getIdent*(storage: ValidatorStorage): ValidatorIdent =
+func getIdent*(storage: ValidatorStorage): ValidatorIdent =
   case storage.kind
   of ValidatorStorageKind.Keystore:
     ValidatorIdent(kind: ValidatorQueryKind.Key,
@@ -164,29 +155,24 @@ proc restValidatorExit(config: BeaconNodeConf) {.async.} =
                              value: StateIdentType.Head)
     blockIdentHead = BlockIdent(kind: BlockQueryKind.Named,
                                 value: BlockIdentType.Head)
-    validator = getValidator(config.exitedValidator).valueOr:
-      fatal "Incorrect validator index, key or keystore path specified",
-            value = config.exitedValidator, reason = error
-      quit 1
 
-  let restValidator = try:
-    let response = await client.getStateValidatorPlain(stateIdHead,
-                                                       validator.getIdent())
-    if response.status == 200:
-      let validatorInfo = decodeBytes(GetStateValidatorResponse,
-                                      response.data, response.contentType)
-      if validatorInfo.isErr():
-        raise newException(RestError, $validatorInfo.error)
-      validatorInfo.get().data
-    else:
-      raiseGenericError(response)
-  except CatchableError as exc:
-    fatal "Failed to obtain information for validator", reason = exc.msg
-    quit 1
-
-  let
-    validatorIdx = restValidator.index.uint64
-    validatorKey = restValidator.validator.pubkey
+  # Before making any REST requests, we'll make sure that the supplied
+  # inputs are correct:
+  var validators: seq[ValidatorStorage]
+  if config.exitAllValidatorsFlag:
+    var keystoreCache = KeystoreCacheRef.init()
+    for keystore in listLoadableKeystores(config, keystoreCache):
+      validators.add ValidatorStorage(kind: ValidatorStorageKind.Keystore,
+                                      privateKey: keystore.privateKey)
+  else:
+    var decryptor: MultipleKeystoresDecryptor
+    defer: dispose decryptor
+    for pubKey in config.exitedValidators:
+      let validatorStorage = decryptor.getValidator(pubkey).valueOr:
+        fatal "Incorrect validator index, key or keystore path specified",
+              value = pubKey, reason = error
+        quit 1
+      validators.add validatorStorage
 
   let genesis = try:
     let response = await client.getGenesisPlain()
@@ -204,16 +190,18 @@ proc restValidatorExit(config: BeaconNodeConf) {.async.} =
            reason = exc.msg
     quit 1
 
-  let exitAtEpoch = if config.exitAtEpoch.isSome:
-    Epoch config.exitAtEpoch.get
-  else:
+  let currentEpoch = block:
     let
-      genesisTime =  genesis.genesis_time
+      genesisTime = genesis.genesis_time
       beaconClock = BeaconClock.init(genesisTime)
       time = getTime()
       slot = beaconClock.toSlot(time).slot
-      epoch = slot.uint64 div 32
-    Epoch epoch
+    Epoch(slot.uint64 div 32)
+
+  let exitAtEpoch = if config.exitAtEpoch.isSome:
+    Epoch config.exitAtEpoch.get
+  else:
+    currentEpoch
 
   let fork = try:
     let response = await client.getStateForkPlain(stateIdHead)
@@ -231,67 +219,115 @@ proc restValidatorExit(config: BeaconNodeConf) {.async.} =
            reason = exc.msg
     quit 1
 
-  let
-    genesis_validators_root = genesis.genesis_validators_root
-    validatorKeyAsStr = "0x" & $validatorKey
-    signedExit = getSignedExitMessage(config,
-                                      validator,
-                                      validatorKeyAsStr,
-                                      exitAtEpoch,
-                                      validatorIdx,
-                                      fork,
-                                      genesis_validators_root)
+  let signingFork = try:
+    let response = await client.getSpec()
+    if response.status == 200:
+      let spec = response.data
+      # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/phase0/beacon-chain.md#voluntary-exits
+      # https://github.com/ethereum/consensus-specs/blob/v1.4.0-beta.0/specs/deneb/beacon-chain.md#modified-process_voluntary_exit
+      if currentEpoch >= Epoch(spec.data.DENEB_FORK_EPOCH):
+        Fork(
+          current_version: spec.data.CAPELLA_FORK_VERSION,
+          previous_version: spec.data.CAPELLA_FORK_VERSION,
+          epoch: GENESIS_EPOCH)  # irrelevant when current/previous identical
+      else:
+        fork
+    else:
+      raise newException(RestError, "Error response (" & $response.status & ")")
+  except CatchableError as exc:
+    fatal "Failed to obtain the config spec of the beacon node",
+           reason = exc.msg
+    quit 1
 
-  if config.printData:
-    let bytes = encodeBytes(signedExit, "application/json").valueOr:
-      fatal "Unable to serialize signed exit message", reason = error
+  if not config.printData:
+    case askForExitConfirmation()
+    of ClientExitAction.abort:
+      quit 0
+    of ClientExitAction.confirm:
+      discard
+
+  var hadErrors = false
+  for validator in validators:
+    let restValidator = try:
+      let response = await client.getStateValidatorPlain(stateIdHead, validator.getIdent)
+      if response.status == 200:
+        let validatorInfo = decodeBytes(GetStateValidatorResponse,
+                                        response.data, response.contentType)
+        if validatorInfo.isErr():
+          raise newException(RestError, $validatorInfo.error)
+        validatorInfo.get().data
+      else:
+        raiseGenericError(response)
+    except CatchableError as exc:
+      fatal "Failed to obtain information for validator", reason = exc.msg
       quit 1
 
-    echoP "You can use following command to send voluntary exit message to " &
-          "remote beacon node host:\n"
+    let
+      validatorIdx = restValidator.index.uint64
+      validatorKey = restValidator.validator.pubkey
 
-    echo "curl -X 'POST' \\"
-    echo "  '" & config.restUrlForExit &
-         "/eth/v1/beacon/pool/voluntary_exits' \\"
-    echo "  -H 'Accept: */*' \\"
-    echo "  -H 'Content-Type: application/json' \\"
-    echo "  -d '" & string.fromBytes(bytes) & "'"
-    quit 0
-  else:
-    try:
-      let choice = askForExitConfirmation()
-      if choice == ClientExitAction.quiting:
-        quit 0
-      elif choice == ClientExitAction.confirmation:
+    let
+      genesis_validators_root = genesis.genesis_validators_root
+      validatorKeyAsStr = "0x" & $validatorKey
+      signedExit = getSignedExitMessage(config,
+                                        validator,
+                                        validatorKeyAsStr,
+                                        exitAtEpoch,
+                                        validatorIdx,
+                                        fork,
+                                        genesis_validators_root)
+
+    if config.printData:
+      let bytes = encodeBytes(signedExit, "application/json").valueOr:
+        error "Unable to serialize signed exit message", reason = error
+        hadErrors = true
+        continue
+
+      echoP "You can use following command to send voluntary exit message to " &
+            "remote beacon node host:\n"
+
+      echo "curl -X 'POST' \\"
+      echo "  '" & config.restUrlForExit &
+           "/eth/v1/beacon/pool/voluntary_exits' \\"
+      echo "  -H 'Accept: */*' \\"
+      echo "  -H 'Content-Type: application/json' \\"
+      echo "  -d '" & string.fromBytes(bytes) & "'"
+      quit 0
+    else:
+      try:
         let
+          validatorDesc = $validatorIdx & "(" & validatorKeyAsStr[0..9] & ")"
           response = await client.submitPoolVoluntaryExit(signedExit)
           success = response.status == 200
         if success:
           echo "Successfully published voluntary exit for validator " &
-                $validatorIdx & "(" & validatorKeyAsStr[0..9] & ")."
-          quit 0
+                validatorDesc & "."
         else:
+          hadErrors = true
           let responseError = try:
-                Json.decode(response.data, RestErrorMessage)
+            Json.decode(response.data, RestErrorMessage)
           except CatchableError as exc:
-            fatal "Failed to decode invalid error server response on " &
+            error "Failed to decode invalid error server response on " &
                   "`submitPoolVoluntaryExit` request", reason = exc.msg
-            quit 1
+            continue
 
           let
             responseMessage = responseError.message
             responseStacktraces = responseError.stacktraces
 
-          echo "The voluntary exit was not submitted successfully."
+          echo "The voluntary exit for validator " & validatorDesc &
+               " was not submitted successfully."
           echo responseMessage & ":"
           for el in responseStacktraces.get():
             echo el
           echoP "Please try again."
-          quit 1
+      except CatchableError as err:
+        fatal "Failed to send the signed exit message",
+              signedExit, reason = err.msg
+        hadErrors = true
 
-    except CatchableError as err:
-      fatal "Failed to send the signed exit message", reason = err.msg
-      quit 1
+  if hadErrors:
+    quit 1
 
 proc handleValidatorExitCommand(config: BeaconNodeConf) {.async.} =
   await restValidatorExit(config)

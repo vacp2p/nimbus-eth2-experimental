@@ -1,5 +1,5 @@
 # beacon_chain
-# Copyright (c) 2021-2022 Status Research & Development GmbH
+# Copyright (c) 2021-2023 Status Research & Development GmbH
 # Licensed and distributed under either of
 #   * MIT license (license terms in the root directory or at https://opensource.org/licenses/MIT).
 #   * Apache v2 license (license terms in the root directory or at https://www.apache.org/licenses/LICENSE-2.0).
@@ -10,7 +10,7 @@
 import
   std/[typetraits, os, options, json, sequtils, uri, algorithm],
   testutils/unittests, chronicles, stint, json_serialization, confutils,
-  chronos, eth/keys, blscurve, libp2p/crypto/crypto as lcrypto,
+  chronos, blscurve, libp2p/crypto/crypto as lcrypto,
   stew/[byteutils, io2], stew/shims/net,
 
   ../beacon_chain/spec/[crypto, keystore, eth2_merkleization],
@@ -109,19 +109,19 @@ const
 func specifiedFeeRecipient(x: int): Eth1Address =
   copyMem(addr result, unsafeAddr x, sizeof x)
 
-proc contains*(keylist: openArray[KeystoreInfo], key: ValidatorPubKey): bool =
+func contains*(keylist: openArray[KeystoreInfo], key: ValidatorPubKey): bool =
   for item in keylist:
     if item.validating_pubkey == key:
       return true
   false
 
-proc contains*(keylist: openArray[KeystoreInfo], key: string): bool =
+func contains*(keylist: openArray[KeystoreInfo], key: string): bool =
   let pubkey = ValidatorPubKey.fromHex(key).tryGet()
   contains(keylist, pubkey)
 
 proc prepareNetwork =
   let
-    rng = keys.newRng()
+    rng = HmacDrbgContext.new()
     mnemonic = generateMnemonic(rng[])
     seed = getSeed(mnemonic, KeystorePass.init "")
     cfg = defaultRuntimeConfig
@@ -271,7 +271,7 @@ proc addPreTestRemoteKeystores(validatorsDir: string) =
       quit 1
 
 proc startBeaconNode(basePort: int) {.raises: [Defect, CatchableError].} =
-  let rng = keys.newRng()
+  let rng = HmacDrbgContext.new()
 
   copyHalfValidators(nodeDataDir, true)
   addPreTestRemoteKeystores(nodeValidatorsDir)
@@ -309,7 +309,7 @@ proc startBeaconNode(basePort: int) {.raises: [Defect, CatchableError].} =
   # os.removeDir dataDir
 
 proc startValidatorClient(basePort: int) {.async, thread.} =
-  let rng = keys.newRng()
+  let rng = HmacDrbgContext.new()
 
   copyHalfValidators(vcDataDir, false)
   addPreTestRemoteKeystores(vcValidatorsDir)
@@ -363,7 +363,7 @@ proc listRemoteValidators(validatorsDir,
           validatorsDir, secretsDir, err = err.msg
   validators
 
-proc `==`(a: seq[ValidatorPubKey],
+func `==`(a: seq[ValidatorPubKey],
           b: seq[KeystoreInfo | RemoteKeystoreInfo]): bool =
   if len(a) != len(b):
     return false
@@ -390,7 +390,7 @@ proc `==`(a: seq[ValidatorPubKey],
 proc runTests(keymanager: KeymanagerToTest) {.async.} =
   let
     client = RestClientRef.new(initTAddress("127.0.0.1", keymanager.port))
-    rng = keys.newRng()
+    rng = HmacDrbgContext.new()
     privateKey = ValidatorPrivKey.fromRaw(secretBytes).get
 
     allValidators = listLocalValidators(
@@ -507,7 +507,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
     testFlavour = " [" & keymanager.ident & "]" & preset()
 
   suite "Serialization/deserialization" & testFlavour:
-    proc `==`(a, b: Kdf): bool =
+    func `==`(a, b: Kdf): bool =
       if (a.function != b.function) or (a.message != b.message):
         return false
       case a.function
@@ -523,14 +523,14 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
           (a.scryptParams.r == b.scryptParams.r) and
           (seq[byte](a.scryptParams.salt) == seq[byte](b.scryptParams.salt))
 
-    proc `==`(a, b: Checksum): bool =
+    func `==`(a, b: Checksum): bool =
       if a.function != b.function:
         return false
       case a.function
       of ChecksumFunctionKind.sha256Checksum:
         a.message.data == b.message.data
 
-    proc `==`(a, b: Cipher): bool =
+    func `==`(a, b: Cipher): bool =
       if (a.function != b.function) or
          (seq[byte](a.message) != seq[byte](b.message)):
         return false
@@ -538,11 +538,11 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
       of CipherFunctionKind.aes128CtrCipher:
         seq[byte](a.params.iv) == seq[byte](b.params.iv)
 
-    proc `==`(a, b: Crypto): bool =
+    func `==`(a, b: Crypto): bool =
       (a.kdf == b.kdf) and (a.checksum == b.checksum) and
         (a.cipher == b.cipher)
 
-    proc `==`(a, b: Keystore): bool =
+    func `==`(a, b: Keystore): bool =
       (a.crypto == b.crypto) and (a.pubkey == b.pubkey) and
         (string(a.path) == string(b.path)) and
         (a.description == b.description) and (a.uuid == b.uuid) and
@@ -1047,7 +1047,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
           response.status == 403
           responseJson["message"].getStr() == InvalidAuthorizationError
 
-    asyncTest "Obtaining the fee recpient of a missing validator returns 404" & testFlavour:
+    asyncTest "Obtaining the fee recipient of a missing validator returns 404" & testFlavour:
       let
         pubkey = ValidatorPubKey.fromHex(unusedPublicKeys[0]).expect("valid key")
         response = await client.listFeeRecipientPlain(
@@ -1068,7 +1068,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
       check:
         resultFromApi == feeRecipient
 
-    asyncTest "Obtaining the fee recpient of an unconfigured validator returns the suggested default" & testFlavour:
+    asyncTest "Obtaining the fee recipient of an unconfigured validator returns the suggested default" & testFlavour:
       let
         pubkey = ValidatorPubKey.fromHex(oldPublicKeys[0]).expect("valid key")
         resultFromApi = await client.listFeeRecipient(pubkey, correctTokenValue)
@@ -1076,7 +1076,7 @@ proc runTests(keymanager: KeymanagerToTest) {.async.} =
       check:
         resultFromApi == defaultFeeRecipient
 
-    asyncTest "Configuring the fee recpient" & testFlavour:
+    asyncTest "Configuring the fee recipient" & testFlavour:
       let
         pubkey = ValidatorPubKey.fromHex(oldPublicKeys[1]).expect("valid key")
         firstFeeRecipient = specifiedFeeRecipient(2)
