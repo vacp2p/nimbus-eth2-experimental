@@ -1819,6 +1819,7 @@ proc new(T: type Eth2Node,
     switch: switch,
     torSwitch: torSwitch,
     pubsub: pubsub,
+    torpubsub: torpubsub,
     wantedPeers: config.maxPeers,
     hardMaxPeers: config.hardMaxPeers.get(config.maxPeers * 3 div 2), #*1.5
     cfg: runtimeCfg,
@@ -2562,7 +2563,7 @@ proc broadcastTor(node: Eth2Node, topic: string, msg: seq[byte]):
     return ok()
   else:
     # Increments libp2p_gossipsub_failed_publish metric
-    return err("No peers on libp2p topic")
+    return err("No peers on tor libp2p topic")
 
 proc broadcastTor(node: Eth2Node, topic: string, msg: auto):
     Future[Result[void, cstring]] =
@@ -2706,22 +2707,22 @@ proc broadcastBeaconBlock*(
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: altair.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.altair)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: bellatrix.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.bellatrix)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: capella.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.capella)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: deneb.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.deneb)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBlobSidecar*(
     node: Eth2Node, subnet_id: SubnetId, blob: deneb.SignedBlobSidecar):
