@@ -65,7 +65,6 @@ type
     switch*: Switch
     torSwitch*: TorSwitch
     pubsub*: GossipSub
-    torpubsub*: GossipSub
     discovery*: Eth2DiscoveryProtocol
     discoveryEnabled*: bool
     wantedPeers*: int
@@ -1842,7 +1841,6 @@ proc new(T: type Eth2Node,
     switch: switch,
     torSwitch: torSwitch,
     pubsub: pubsub,
-    torpubsub: torpubsub,
     wantedPeers: config.maxPeers,
     hardMaxPeers: config.hardMaxPeers.get(config.maxPeers * 3 div 2), #*1.5
     cfg: runtimeCfg,
@@ -2372,9 +2370,6 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   var torSwitch = TorSwitch.new(torServer = torServer, rng = rng,  flags = {ReuseAddr} )
 
 
-  # adding tor switch
-  let torServer = initTAddress("127.0.0.1", 9050.Port)
-  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng,  flags = {ReuseAddr} )
 
 
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
@@ -2446,19 +2441,8 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
       maxMessageSize = GOSSIP_MAX_SIZE_BELLATRIX,
       parameters = params)
     
-    torpubsub = GossipSub.init(
-      switch = torSwitch,
-      msgIdProvider = msgIdProvider,
-      # We process messages in the validator, so we don't need data callbacks
-      triggerSelf = false,
-      sign = false,
-      verifySignature = false,
-      anonymize = true,
-      maxMessageSize = GOSSIP_MAX_SIZE_BELLATRIX,
-      parameters = params)
 
   switch.mount(pubsub)
-  torSwitch.mount(torpubsub)
   
 
   let node = Eth2Node.new(
@@ -2597,23 +2581,6 @@ proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
     # Increments libp2p_gossipsub_failed_publish metric
     return err("No peers on libp2p topic")
 
-proc broadcastTor(node: Eth2Node, topic: string, msg: seq[byte]):
-    Future[Result[void, cstring]] {.async.} =
-  let peers = await node.torpubsub.publish(topic, msg) 
-
-  # TODO remove workaround for sync committee BN/VC log spam
-  if peers > 0 or find(topic, "sync_committee_") != -1:
-    inc nbc_gossip_messages_sent
-    return ok()
-  else:
-    # Increments libp2p_gossipsub_failed_publish metric
-    return err("No peers on tor libp2p topic")
-
-proc broadcastTor(node: Eth2Node, topic: string, msg: auto):
-    Future[Result[void, cstring]] =
-  broadcastTor(node, topic, gossipEncode(msg))
-
-
 proc broadcast(node: Eth2Node, topic: string, msg: auto):
     Future[Result[void, cstring]] =
   # Avoid {.async.} copies of message while broadcasting
@@ -2748,23 +2715,19 @@ proc broadcastBeaconBlock*(
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: altair.SignedBeaconBlock): Future[SendResult] =
-  let topic = getBeaconBlocksTopic(node.forkDigests.altair)
-  node.broadcastTor(topic, blck)
+  node.broadcastTorPush(gossipEncode(blck))
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: bellatrix.SignedBeaconBlock): Future[SendResult] =
-  let topic = getBeaconBlocksTopic(node.forkDigests.bellatrix)
-  node.broadcastTor(topic, blck)
+  node.broadcastTorPush(gossipEncode(blck))
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: capella.SignedBeaconBlock): Future[SendResult] =
-  let topic = getBeaconBlocksTopic(node.forkDigests.capella)
-  node.broadcastTor(topic, blck)
+  node.broadcastTorPush(gossipEncode(blck))
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: deneb.SignedBeaconBlock): Future[SendResult] =
-  let topic = getBeaconBlocksTopic(node.forkDigests.deneb)
-  node.broadcastTor(topic, blck)
+  node.broadcastTorPush(gossipEncode(blck))
 
 proc broadcastBlobSidecar*(
     node: Eth2Node, subnet_id: SubnetId, blob: deneb.SignedBlobSidecar):
