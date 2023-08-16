@@ -19,7 +19,7 @@ import
   json_serialization, json_serialization/std/[net, sets, options],
   chronos, chronos/ratelimit, chronicles, metrics,
   libp2p/[switch, peerinfo, multiaddress, multicodec, crypto/crypto,
-    crypto/secp, builders],
+    crypto/secp, builders, transports/tortransport],
   libp2p/protocols/pubsub/[
       pubsub, gossipsub, rpc/message, rpc/messages, peertable, pubsubpeer],
   libp2p/stream/connection,
@@ -79,6 +79,8 @@ type
     seenTable: Table[PeerId, SeenItem]
     connWorkers: seq[Future[void]]
     connTable: HashSet[PeerId]
+    torPeers:AsyncQueue[PeerAddr]
+    seenTorPeers:HashSet[PeerAddr]
     forkId*: ENRForkID
     discoveryForkId*: ENRForkID
     forkDigests*: ref ForkDigests
@@ -1589,6 +1591,27 @@ proc getLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
       default(SyncnetBits)
   )
 
+proc runTorPushPeerDiscovery(node: Eth2Node) {.async.} = 
+  debug  "Update tor discovered nodes and context"
+  let torServer = initTAddress("127.0.0.1", 9050.Port)
+  while true:
+    let 
+      discvNodes = await node.discovery.queryRandom()
+      
+    for discvnd in discvNodes:
+      let res = discvnd.toPeerAddr()
+      if(res.isErr()): continue
+      let peeraddr = res.get()
+      if node.seenTorPeers.contains(peeraddr) and 
+          node.checkPeer(peeraddr):
+        node.torPeers.addLast(peeraddr)
+
+    # Try to refresh torSwitch as well 
+    #node.torSwitch =  TorSwitch.new(torServer = torServer, rng = Rng,  flags = {ReuseAddr} )        
+      
+    #default period for epoch
+    await sleepAsync(10.minutes)
+
 proc runDiscoveryLoop(node: Eth2Node) {.async.} =
   debug "Starting discovery loop"
 
@@ -1796,7 +1819,7 @@ proc new(T: type Eth2Node,
          config: BeaconNodeConf | LightClientConf, runtimeCfg: RuntimeConfig,
          enrForkId: ENRForkID, discoveryForkId: ENRForkID,
          forkDigests: ref ForkDigests, getBeaconTime: GetBeaconTimeFn,
-         switch: Switch, torSwitch: TorSwitch, pubsub: GossipSub, torpubsub: GossipSub,
+         switch: Switch, torSwitch: TorSwitch, pubsub: GossipSub,
          ip: Option[ValidIpAddress], tcpPort, udpPort: Option[Port],
          privKey: keys.PrivateKey, discovery: bool,
          rng: ref HmacDrbgContext): T {.raises: [Defect, CatchableError].} =
@@ -1932,6 +1955,7 @@ proc start*(node: Eth2Node) {.async.} =
   if node.discoveryEnabled:
     node.discovery.start()
     traceAsyncErrors node.runDiscoveryLoop()
+    traceAsyncErrors node.runTorPushPeerDiscovery()
   else:
     notice "Discovery disabled; trying bootstrap nodes",
       nodes = node.discovery.bootstrapRecords.len
@@ -2348,6 +2372,11 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   var torSwitch = TorSwitch.new(torServer = torServer, rng = rng,  flags = {ReuseAddr} )
 
 
+  # adding tor switch
+  let torServer = initTAddress("127.0.0.1", 9050.Port)
+  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng,  flags = {ReuseAddr} )
+
+
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
 
   func msgIdProvider(m: messages.Message): Result[seq[byte], ValidationResult] =
@@ -2433,7 +2462,7 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   
 
   let node = Eth2Node.new(
-    config, cfg, enrForkId, discoveryForkId, forkDigests, getBeaconTime, switch, torSwitch, pubsub, torpubsub, extIp,
+    config, cfg, enrForkId, discoveryForkId, forkDigests, getBeaconTime, switch, torSwitch, pubsub, extIp,
     extTcpPort, extUdpPort, netKeys.seckey.asEthKey,
     discovery = config.discv5Enabled, rng = rng)
 
@@ -2541,6 +2570,21 @@ proc gossipEncode(msg: auto): seq[byte] =
 
   snappy.encode(uncompressed)
 
+proc broadcastTorPush(node:Eth2Node, msg:seq[byte]):
+    Future[Result[void, cstring]] {.async.} =
+  # establish connections with torPeers with atmost 6 outdegree
+  # and push encoded message
+  var count: int
+  count = 0
+  while count != 6 and not node.torPeers.empty():
+    let remotePeer = await node.torPeers.popFirst()
+    let conn = await node.torSwitch.dial(remotePeer.peerId, remotePeer.addrs, GossipSubCodec)
+    count += 1
+    await conn.write(msg)
+    await conn.close()
+
+  ok()
+  
 proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
     Future[Result[void, cstring]] {.async.} =
   let peers = await node.pubsub.publish(topic, msg) 
@@ -2700,9 +2744,7 @@ proc broadcastAggregateAndProof*(
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: phase0.SignedBeaconBlock): Future[SendResult] =
-  let topic = getBeaconBlocksTopic(node.forkDigests.phase0)
-  # for block broad cast, use Tor pubsub
-  node.broadcastTor(topic, blck)
+  node.broadcastTorPush(gossipEncode(blck))
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: altair.SignedBeaconBlock): Future[SendResult] =
