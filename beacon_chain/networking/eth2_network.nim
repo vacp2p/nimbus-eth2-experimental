@@ -31,11 +31,6 @@ import
   ../validators/keystore_management,
   "."/[eth2_discovery, libp2p_json_serialization, peer_pool, peer_scores]
 
-import libp2p/[transports/tortransport]
-                
-#import ./helpers, ./stubs/torstub, ./commontransport
-
-
 export
   tables, chronos, ratelimit, version, multiaddress, peerinfo, p2pProtocol,
   connection, libp2p_json_serialization, eth2_ssz_serialization, results,
@@ -2370,8 +2365,6 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   var torSwitch = TorSwitch.new(torServer = torServer, rng = rng,  flags = {ReuseAddr} )
 
 
-
-
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
 
   func msgIdProvider(m: messages.Message): Result[seq[byte], ValidationResult] =
@@ -2441,10 +2434,7 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
       maxMessageSize = GOSSIP_MAX_SIZE_BELLATRIX,
       parameters = params)
     
-
   switch.mount(pubsub)
-  
-
   let node = Eth2Node.new(
     config, cfg, enrForkId, discoveryForkId, forkDigests, getBeaconTime, switch, torSwitch, pubsub, extIp,
     extTcpPort, extUdpPort, netKeys.seckey.asEthKey,
@@ -2453,7 +2443,8 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   node.pubsub.subscriptionValidator =
     proc(topic: string): bool {.gcsafe, raises: [].} =
       topic in node.validTopics
-
+  
+  node
 
 func announcedENR*(node: Eth2Node): enr.Record =
   doAssert node.discovery != nil, "The Eth2Node must be initialized"
@@ -2571,7 +2562,7 @@ proc broadcastTorPush(node:Eth2Node, msg:seq[byte]):
   
 proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
     Future[Result[void, cstring]] {.async.} =
-  let peers = await node.pubsub.publish(topic, msg) 
+  let peers = await node.pubsub.publish(topic, msg)
 
   # TODO remove workaround for sync committee BN/VC log spam
   if peers > 0 or find(topic, "sync_committee_") != -1:
