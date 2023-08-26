@@ -1586,9 +1586,10 @@ proc getLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
   )
 
 proc runTorPushPeerDiscovery(node: Eth2Node) {.async.} = 
-  debug  "Update tor discovered nodes and context"
+  notice  "Updating tor discovered nodes and context"
   let torServer = initTAddress("127.0.0.1", 9050.Port)
   while true:
+    notice "Querying nodes "
     let 
       discvNodes = await node.discovery.queryRandom()
       
@@ -1596,8 +1597,10 @@ proc runTorPushPeerDiscovery(node: Eth2Node) {.async.} =
       let res = discvnd.toPeerAddr()
       if(res.isErr()): continue
       let peeraddr = res.get()
-      if node.seenTorPeers.contains(peeraddr) and 
+      echo "found ", peeraddr
+      if not node.seenTorPeers.contains(peeraddr) and 
           node.checkPeer(peeraddr):
+        echo "Added "
         node.torPeers.addLast(peeraddr)
 
     # Try to refresh torSwitch as well 
@@ -1663,7 +1666,7 @@ proc runDiscoveryLoop(node: Eth2Node) {.async.} =
             current_peers = len(node.peerPool),
             discovered_nodes = len(discoveredNodes),
             new_peers = len(newPeers)
-
+ 
       if len(newPeers) == 0:
         let currentPeers = len(node.peerPool)
         if currentPeers <= node.wantedPeers shr 2: #  25%
@@ -1843,6 +1846,7 @@ proc new(T: type Eth2Node,
     # Its important here to create AsyncQueue with limited size, otherwise
     # it could produce HIGH cpu usage.
     connQueue: newAsyncQueue[PeerAddr](ConcurrentConnections),
+    torPeers: newAsyncQueue[PeerAddr](100),
     metadata: metadata,
     forkId: enrForkId,
     discoveryForkId: discoveryForkId,
@@ -2443,7 +2447,7 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   node.pubsub.subscriptionValidator =
     proc(topic: string): bool {.gcsafe, raises: [].} =
       topic in node.validTopics
-  
+
   node
 
 func announcedENR*(node: Eth2Node): enr.Record =
@@ -2545,19 +2549,29 @@ proc gossipEncode(msg: auto): seq[byte] =
 
   snappy.encode(uncompressed)
 
-proc broadcastTorPush(node:Eth2Node, msg:seq[byte]):
-    Future[Result[void, cstring]] {.async.} =
-  # establish connections with torPeers with atmost 6 outdegree
-  # and push encoded message
-  var count: int
-  count = 0
-  while count != 6 and not node.torPeers.empty():
-    let remotePeer = await node.torPeers.popFirst()
-    let conn = await node.torSwitch.dial(remotePeer.peerId, remotePeer.addrs, GossipSubCodec)
-    count += 1
+proc sendTorpush(node:Eth2Node, remotePeer:PeerAddr, msg:seq[byte]) {.async.} =
+  try:
+    echo "Trying over Tor to connect to ", remotePeer
+    let conn =  await node.torSwitch.dial(remotePeer.peerId, remotePeer.addrs, GossipSubCodec)
     await conn.write(msg)
     await conn.close()
+    echo "Successfully pushed over Tor " , remotePeer 
+  except Exception as e:
+    echo "Failed to pushed over Tor " , remotePeer , e.msg
 
+proc broadcastTorPush(node:Eth2Node, msg:seq[byte]):
+    Future[Result[void, cstring]] {.async.} =
+  # establish connections with torPeers 
+  # and push encoded message
+  var attempt: int
+  attempt = 0
+  var torfutures: seq[Future[void]] = @[]
+  while attempt != 20 and not node.torPeers.empty():
+    let remotePeer = await node.torPeers.popFirst()
+    torfutures.add(sendTorpush(node, remotePeer, msg))
+    attempt += 1
+  await all(torfutures)
+  echo "Done broadcasting over tor"
   ok()
   
 proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
@@ -2668,7 +2682,8 @@ proc broadcastAttestation*(
   let
     forkPrefix = node.forkDigestAtEpoch(node.getWallEpoch)
     topic = getAttestationTopic(forkPrefix, subnet_id)
-  node.broadcast(topic, attestation)
+  notice "broadcasting attestation on Tor"
+  node.broadcastTorPush(gossipEncode(attestation))
 
 proc broadcastVoluntaryExit*(
     node: Eth2Node, exit: SignedVoluntaryExit): Future[SendResult] =
