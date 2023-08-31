@@ -261,6 +261,7 @@ proc processSignedBeaconBlock*(
     # Validator monitor registration for blocks is done by the processor
     beacon_blocks_received.inc()
     beacon_block_delay.observe(delay.toFloatSeconds())
+    echo "Block Delay", delay
   else:
     debug "Dropping block", error = v.error()
 
@@ -387,6 +388,7 @@ proc processAttestation*(
   # Potential under/overflows are fine; would just create odd metrics and logs
   let delay = wallTime - attestation.data.slot.start_beacon_time
   debug "Attestation received", delay
+  #echo "Attestation Delay ", $delay, $attestation
 
   # Now proceed to validation
   let v =
