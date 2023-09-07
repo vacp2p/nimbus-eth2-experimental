@@ -1907,12 +1907,13 @@ proc startListening*(node: Eth2Node) {.async.} =
     fatal "Failed to start LibP2P transport. TCP port may be already in use",
           err = err.msg
     quit 1
-  try:
+  #[try:
     await node.torSwitch.start()
   except CatchableError as err:
     fatal "Failed to start TorSwitch transport. Check if server already running on port",
           err = err.msg
     quit 1
+  ]#
 
 
 proc peerPingerHeartbeat(node: Eth2Node): Future[void] {.gcsafe.}
@@ -2345,9 +2346,10 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   
   # adding tor switch
   let torServer = initTAddress("127.0.0.1", 9050.Port)
-  let tkp = getRandomNetKeys(rng)
+  let tkp = getRandomNetKeys(rng = rng[])
   let oa = MultiAddress.init("/ip4/0.0.0.0/tcp/8080/onion3/a2mncbqsbullu7thgm4e6zxda2xccmcgzmaq44oayhdtm6rav5vovcad:80").tryGet()
-  var torSwitch = TorSwitch.new(torServer, rng, @[oa], {ReuseAddr}, tkp.seckey )
+  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng, flags = {ReuseAddr}, 
+    seckey = tkp.seckey)
 
 
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
@@ -2442,7 +2444,8 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   node.pubsub.subscriptionValidator =
     proc(topic: string): bool {.gcsafe, raises: [].} =
       topic in node.validTopics
-
+  
+  node
 
 func announcedENR*(node: Eth2Node): enr.Record =
   doAssert node.discovery != nil, "The Eth2Node must be initialized"
@@ -2669,6 +2672,7 @@ proc broadcastAttestation*(
     forkPrefix = node.forkDigestAtEpoch(node.getWallEpoch)
     topic = getAttestationTopic(forkPrefix, subnet_id)
   node.broadcastTor(topic, attestation)
+  echo "attestaion over tor"
 
 proc broadcastVoluntaryExit*(
     node: Eth2Node, exit: SignedVoluntaryExit): Future[SendResult] =
