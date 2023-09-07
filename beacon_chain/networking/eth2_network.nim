@@ -1297,7 +1297,7 @@ proc checkPeer(node: Eth2Node, peerAddr: PeerAddr): bool =
     else:
       true
 
-proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
+proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {.async.} =
   ## Establish connection with remote peer identified by address ``peerAddr``.
   logScope:
     peer = peerAddr.peerId
@@ -1308,7 +1308,13 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
 
   debug "Connecting to discovered peer"
   var deadline = sleepAsync(node.connectTimeout)
-  var workfut = node.switch.connect(
+
+  var workfut = if isnotTor : node.switch.connect(
+    peerAddr.peerId,
+    peerAddr.addrs,
+    forceDial = true
+  )
+  else : node.torSwitch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
     forceDial = true
@@ -1322,6 +1328,7 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
       if not deadline.finished():
         deadline.cancel()
       inc nbc_successful_dials
+      echo "Connect successful", isnotTor, peerAddr
     else:
       debug "Connection to remote peer timed out"
       inc nbc_timeout_dials
@@ -1338,6 +1345,7 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
     # This loop will never produce HIGH CPU usage because it will wait
     # and block until it not obtains new peer from the queue ``connQueue``.
     let remotePeerAddr = await node.connQueue.popFirst()
+    
     # Previous worker dial might have hit the maximum peers.
     # TODO: could clear the whole connTable and connQueue here also, best
     # would be to have this event based coming from peer pool or libp2p.
@@ -1348,6 +1356,10 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
     # excluding peer here after processing.
     node.connTable.excl(remotePeerAddr.peerId)
 
+    let remoteTorPeerAddr = await node.connQueue.popFirst()
+    await node.dialPeer(remoteTorPeerAddr, index, false)
+    
+    
 proc toPeerAddr(node: Node): Result[PeerAddr, cstring] =
   let nodeRecord = ? node.record.toTypedRecord()
   let peerAddr = ? nodeRecord.toPeerAddr(tcpProtocol)
@@ -2346,10 +2358,9 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   
   # adding tor switch
   let torServer = initTAddress("127.0.0.1", 9050.Port)
-  let tkp = getRandomNetKeys(rng = rng[])
-  let oa = MultiAddress.init("/ip4/0.0.0.0/tcp/8080/onion3/a2mncbqsbullu7thgm4e6zxda2xccmcgzmaq44oayhdtm6rav5vovcad:80").tryGet()
-  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng, flags = {ReuseAddr}, 
-    seckey = tkp.seckey)
+  #let tkp = getRandomNetKeys(rng = rng[])
+  #let oa = MultiAddress.init("/ip4/0.0.0.0/tcp/8080/onion3/a2mncbqsbullu7thgm4e6zxda2xccmcgzmaq44oayhdtm6rav5vovcad:80").tryGet()
+  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng, flags = {ReuseAddr})
 
 
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
@@ -2442,6 +2453,9 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
     discovery = config.discv5Enabled, rng = rng)
 
   node.pubsub.subscriptionValidator =
+    proc(topic: string): bool {.gcsafe, raises: [].} =
+      topic in node.validTopics
+  node.torpubsub.subscriptionValidator = 
     proc(topic: string): bool {.gcsafe, raises: [].} =
       topic in node.validTopics
   
@@ -2560,7 +2574,8 @@ proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
 
 proc broadcastTor(node: Eth2Node, topic: string, msg: seq[byte]):
     Future[Result[void, cstring]] {.async.} =
-  let peers = await node.torpubsub.publish(topic, msg) 
+  let peers = await node.torpubsub.publish(topic, msg)
+  echo "Peers from publish", peers
 
   # TODO remove workaround for sync committee BN/VC log spam
   if peers > 0 or find(topic, "sync_committee_") != -1:
@@ -2671,8 +2686,8 @@ proc broadcastAttestation*(
   let
     forkPrefix = node.forkDigestAtEpoch(node.getWallEpoch)
     topic = getAttestationTopic(forkPrefix, subnet_id)
+  echo "about to send attestion"
   node.broadcastTor(topic, attestation)
-  echo "attestaion over tor"
 
 proc broadcastVoluntaryExit*(
     node: Eth2Node, exit: SignedVoluntaryExit): Future[SendResult] =
