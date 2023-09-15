@@ -1328,7 +1328,7 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {
       if not deadline.finished():
         deadline.cancel()
       inc nbc_successful_dials
-      echo "Connect successful", isnotTor, peerAddr
+      echo "Connect successful, ", " Switch type:", isnotTor, peerAddr
     else:
       debug "Connection to remote peer timed out"
       inc nbc_timeout_dials
