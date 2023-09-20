@@ -7,16 +7,22 @@ slot_pattern = r'slot: (\d+)'
 delayslotsignature = r'delay=([^ ]+).+slot: (\d+).+signature: \\"([^\\]+)'
 
 def dur_to_delta( log_dur):
-    pattern = r'(-?\d+)s(\d+)ms(\d+)us(\d+)ns'
+    pattern = r'(-?)((\d+)s)?((\d+)ms)?((\d+)us)?((\d+)ns)?'
     match = re.match(pattern, log_dur)
+    seconds = millis = micros = nanos = 0
     td = timedelta()
     if match:
-        seconds = int(match.group(1))
-        millis = int(match.group(2))
-        micros = int(match.group(3))
-        nanos = int(match.group(4))
-        total_milli_secs = seconds *1000 + millis + micros / 1000 + nanos / 1000000
+        sign = -1 if match.group(1) == "-" else 1
+        if match.group(2) is not None:
+            seconds = int(match.group(3))
+        if match.group(4) is not None:
+            millis = int(match.group(5))
+        if match.group(6) is not None: 
+            micros = int(match.group(7))
+        if match.group(8) is not None:    
+            nanos = int(match.group(9))
 
+        total_milli_secs = sign * ( seconds * 1000 + millis + micros / 1000 + nanos / 1000000)
         td = timedelta(milliseconds=total_milli_secs)
     return td
 
@@ -35,7 +41,7 @@ def parse_sent_log(sent_file):
                 signature = signature_match.group(1)
                 delay = delay_match.group(1)
                 slot = slot_match.group(1)
-                print(f"Signature: {signature}, Delay: {delay}, Slot: {slot}")
+                #print(f"Signature: {signature}, Delay: {delay}, Slot: {slot}")
                 sent_entries[signature] = [delay,  slot]
     return sent_entries
 
