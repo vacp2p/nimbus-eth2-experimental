@@ -1309,16 +1309,19 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {
   debug "Connecting to discovered peer"
   var deadline = sleepAsync(node.connectTimeout)
 
-  var workfut = if isnotTor : node.switch.connect(
+  var workfut = if isnotTor:
+    echo isnotTor
+    node.switch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
-    forceDial = true
-  )
-  else : node.torSwitch.connect(
+    forceDial = true)
+  else : 
+    echo isnotTor
+    node.torSwitch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
-    forceDial = true
-  )
+    forceDial = true)
+
 
   try:
     # `or` operation will only raise exception of `workfut`, because `deadline`
@@ -1329,6 +1332,7 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {
         deadline.cancel()
       inc nbc_successful_dials
       echo "Connect successful, ", " Switch type:", isnotTor, peerAddr
+      echo "Peer pool", len(node.peer_pool)
     else:
       debug "Connection to remote peer timed out"
       inc nbc_timeout_dials
@@ -1358,6 +1362,8 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
 
     let remoteTorPeerAddr = await node.connQueue.popFirst()
     await node.dialPeer(remoteTorPeerAddr, index, false)
+
+    node.connTable.excl(remoteTorPeerAddr.peerId)
     
     
 proc toPeerAddr(node: Node): Result[PeerAddr, cstring] =
