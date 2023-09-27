@@ -31,6 +31,11 @@ import
   ../validators/keystore_management,
   "."/[eth2_discovery, libp2p_json_serialization, peer_pool, peer_scores]
 
+import libp2p/[transports/tortransport]
+                
+#import ./helpers, ./stubs/torstub, ./commontransport
+
+
 export
   tables, chronos, ratelimit, version, multiaddress, peerinfo, p2pProtocol,
   connection, libp2p_json_serialization, eth2_ssz_serialization, results,
@@ -58,7 +63,9 @@ type
 
   Eth2Node* = ref object of RootObj
     switch*: Switch
+    torSwitch*: TorSwitch
     pubsub*: GossipSub
+    torpubsub*: GossipSub
     discovery*: Eth2DiscoveryProtocol
     discoveryEnabled*: bool
     wantedPeers*: int
@@ -1290,7 +1297,7 @@ proc checkPeer(node: Eth2Node, peerAddr: PeerAddr): bool =
     else:
       true
 
-proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
+proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {.async.} =
   ## Establish connection with remote peer identified by address ``peerAddr``.
   logScope:
     peer = peerAddr.peerId
@@ -1301,11 +1308,20 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
 
   debug "Connecting to discovered peer"
   var deadline = sleepAsync(node.connectTimeout)
-  var workfut = node.switch.connect(
+
+  var workfut = if isnotTor:
+    echo isnotTor
+    node.switch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
-    forceDial = true
-  )
+    forceDial = true)
+  else : 
+    echo isnotTor
+    node.torSwitch.connect(
+    peerAddr.peerId,
+    peerAddr.addrs,
+    forceDial = true)
+
 
   try:
     # `or` operation will only raise exception of `workfut`, because `deadline`
@@ -1315,6 +1331,8 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
       if not deadline.finished():
         deadline.cancel()
       inc nbc_successful_dials
+      echo "Connect successful, ", " Switch type:", isnotTor, peerAddr
+      echo "Peer pool", len(node.peer_pool)
     else:
       debug "Connection to remote peer timed out"
       inc nbc_timeout_dials
@@ -1331,6 +1349,7 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
     # This loop will never produce HIGH CPU usage because it will wait
     # and block until it not obtains new peer from the queue ``connQueue``.
     let remotePeerAddr = await node.connQueue.popFirst()
+    
     # Previous worker dial might have hit the maximum peers.
     # TODO: could clear the whole connTable and connQueue here also, best
     # would be to have this event based coming from peer pool or libp2p.
@@ -1341,6 +1360,12 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
     # excluding peer here after processing.
     node.connTable.excl(remotePeerAddr.peerId)
 
+    let remoteTorPeerAddr = await node.connQueue.popFirst()
+    await node.dialPeer(remoteTorPeerAddr, index, false)
+
+    node.connTable.excl(remoteTorPeerAddr.peerId)
+    
+    
 proc toPeerAddr(node: Node): Result[PeerAddr, cstring] =
   let nodeRecord = ? node.record.toTypedRecord()
   let peerAddr = ? nodeRecord.toPeerAddr(tcpProtocol)
@@ -1789,7 +1814,7 @@ proc new(T: type Eth2Node,
          config: BeaconNodeConf | LightClientConf, runtimeCfg: RuntimeConfig,
          enrForkId: ENRForkID, discoveryForkId: ENRForkID,
          forkDigests: ref ForkDigests, getBeaconTime: GetBeaconTimeFn,
-         switch: Switch, pubsub: GossipSub,
+         switch: Switch, torSwitch: TorSwitch, pubsub: GossipSub, torpubsub: GossipSub,
          ip: Option[ValidIpAddress], tcpPort, udpPort: Option[Port],
          privKey: keys.PrivateKey, discovery: bool,
          rng: ref HmacDrbgContext): T {.raises: [Defect, CatchableError].} =
@@ -1810,7 +1835,9 @@ proc new(T: type Eth2Node,
 
   let node = T(
     switch: switch,
+    torSwitch: torSwitch,
     pubsub: pubsub,
+    torpubsub: torpubsub,
     wantedPeers: config.maxPeers,
     hardMaxPeers: config.hardMaxPeers.get(config.maxPeers * 3 div 2), #*1.5
     cfg: runtimeCfg,
@@ -1898,6 +1925,14 @@ proc startListening*(node: Eth2Node) {.async.} =
     fatal "Failed to start LibP2P transport. TCP port may be already in use",
           err = err.msg
     quit 1
+  #[try:
+    await node.torSwitch.start()
+  except CatchableError as err:
+    fatal "Failed to start TorSwitch transport. Check if server already running on port",
+          err = err.msg
+    quit 1
+  ]#
+
 
 proc peerPingerHeartbeat(node: Eth2Node): Future[void] {.gcsafe.}
 proc peerTrimmerHeartbeat(node: Eth2Node): Future[void] {.gcsafe.}
@@ -2326,6 +2361,13 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
   # that are different from the host address (this is relevant when we
   # are running behind a NAT).
   var switch = newBeaconSwitch(config, netKeys.seckey, hostAddress, rng)
+  
+  # adding tor switch
+  let torServer = initTAddress("127.0.0.1", 9050.Port)
+  #let tkp = getRandomNetKeys(rng = rng[])
+  #let oa = MultiAddress.init("/ip4/0.0.0.0/tcp/8080/onion3/a2mncbqsbullu7thgm4e6zxda2xccmcgzmaq44oayhdtm6rav5vovcad:80").tryGet()
+  var torSwitch = TorSwitch.new(torServer = torServer, rng = rng, flags = {ReuseAddr})
+
 
   let phase0Prefix = "/eth2/" & $forkDigests.phase0
 
@@ -2395,18 +2437,34 @@ proc createEth2Node*(rng: ref HmacDrbgContext,
       anonymize = true,
       maxMessageSize = GOSSIP_MAX_SIZE_BELLATRIX,
       parameters = params)
+    
+    torpubsub = GossipSub.init(
+      switch = torSwitch,
+      msgIdProvider = msgIdProvider,
+      # We process messages in the validator, so we don't need data callbacks
+      triggerSelf = false,
+      sign = false,
+      verifySignature = false,
+      anonymize = true,
+      maxMessageSize = GOSSIP_MAX_SIZE_BELLATRIX,
+      parameters = params)
 
   switch.mount(pubsub)
+  torSwitch.mount(torpubsub)
+  
 
   let node = Eth2Node.new(
-    config, cfg, enrForkId, discoveryForkId, forkDigests, getBeaconTime, switch, pubsub, extIp,
+    config, cfg, enrForkId, discoveryForkId, forkDigests, getBeaconTime, switch, torSwitch, pubsub, torpubsub, extIp,
     extTcpPort, extUdpPort, netKeys.seckey.asEthKey,
     discovery = config.discv5Enabled, rng = rng)
 
   node.pubsub.subscriptionValidator =
     proc(topic: string): bool {.gcsafe, raises: [].} =
       topic in node.validTopics
-
+  node.torpubsub.subscriptionValidator = 
+    proc(topic: string): bool {.gcsafe, raises: [].} =
+      topic in node.validTopics
+  
   node
 
 func announcedENR*(node: Eth2Node): enr.Record =
@@ -2510,7 +2568,7 @@ proc gossipEncode(msg: auto): seq[byte] =
 
 proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
     Future[Result[void, cstring]] {.async.} =
-  let peers = await node.pubsub.publish(topic, msg)
+  let peers = await node.pubsub.publish(topic, msg) 
 
   # TODO remove workaround for sync committee BN/VC log spam
   if peers > 0 or find(topic, "sync_committee_") != -1:
@@ -2519,6 +2577,24 @@ proc broadcast(node: Eth2Node, topic: string, msg: seq[byte]):
   else:
     # Increments libp2p_gossipsub_failed_publish metric
     return err("No peers on libp2p topic")
+
+proc broadcastTor(node: Eth2Node, topic: string, msg: seq[byte]):
+    Future[Result[void, cstring]] {.async.} =
+  let peers = await node.torpubsub.publish(topic, msg)
+  echo "Peers from publish", peers
+
+  # TODO remove workaround for sync committee BN/VC log spam
+  if peers > 0 or find(topic, "sync_committee_") != -1:
+    inc nbc_gossip_messages_sent
+    return ok()
+  else:
+    # Increments libp2p_gossipsub_failed_publish metric
+    return err("No peers on tor libp2p topic")
+
+proc broadcastTor(node: Eth2Node, topic: string, msg: auto):
+    Future[Result[void, cstring]] =
+  broadcastTor(node, topic, gossipEncode(msg))
+
 
 proc broadcast(node: Eth2Node, topic: string, msg: auto):
     Future[Result[void, cstring]] =
@@ -2616,7 +2692,8 @@ proc broadcastAttestation*(
   let
     forkPrefix = node.forkDigestAtEpoch(node.getWallEpoch)
     topic = getAttestationTopic(forkPrefix, subnet_id)
-  node.broadcast(topic, attestation)
+  echo "about to send attestion"
+  node.broadcastTor(topic, attestation)
 
 proc broadcastVoluntaryExit*(
     node: Eth2Node, exit: SignedVoluntaryExit): Future[SendResult] =
@@ -2651,27 +2728,28 @@ proc broadcastAggregateAndProof*(
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: phase0.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.phase0)
-  node.broadcast(topic, blck)
+  # for block broad cast, use Tor pubsub
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: altair.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.altair)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: bellatrix.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.bellatrix)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: capella.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.capella)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: deneb.SignedBeaconBlock): Future[SendResult] =
   let topic = getBeaconBlocksTopic(node.forkDigests.deneb)
-  node.broadcast(topic, blck)
+  node.broadcastTor(topic, blck)
 
 proc broadcastBlobSidecar*(
     node: Eth2Node, subnet_id: SubnetId, blob: deneb.SignedBlobSidecar):
