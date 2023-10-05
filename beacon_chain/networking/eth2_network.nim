@@ -1567,6 +1567,8 @@ proc trimConnections(node: Eth2Node, count: int) =
   var peersInGracePeriod = 0
   for peer in node.peers.values:
     if peer.connectionState != Connected: continue
+    # do not trim anything related to tor
+    if node.torpeerPool.hasPeer(peer.peerId): continue
 
     # Metadata pinger is used as grace period
     if peer.metadata.isNone:
@@ -1721,7 +1723,8 @@ proc getLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
   nbc_gossipsub_healthy_fanout.set(0)
 
   return (
-    findLowSubnets(getAttestationTopic, SubnetId, ATTESTATION_SUBNET_COUNT.int, node.pubsub),
+    #findLowSubnets(getAttestationTopic, SubnetId, ATTESTATION_SUBNET_COUNT.int, node.pubsub),
+    BitArray[ATTESTATION_SUBNET_COUNT.int](),
     # We start looking one epoch before the transition in order to allow
     # some time for the gossip meshes to get healthy:
     if epoch + 1 >= node.cfg.ALTAIR_FORK_EPOCH:
@@ -1741,7 +1744,7 @@ proc runDiscoveryLoop(node: Eth2Node) {.async.} =
       wantedSyncnetsCount = wantedSyncnets.countOnes()
       outgoingPeers = node.peerPool.lenCurrent({PeerType.Outgoing})
       targetOutgoingPeers = max(node.wantedPeers div 10, 3)
-
+    
     if wantedAttnetsCount > 0 or wantedSyncnetsCount > 0 or
         outgoingPeers < targetOutgoingPeers:
 
@@ -1906,8 +1909,10 @@ proc resolvePeer(peer: Peer) =
     nbc_resolve_time.observe(delay.toFloatSeconds())
     debug "Peer's ENR recovered", delay
 
-proc handlePeer*(peer: Peer) {.async.} =
-  let res = peer.network.peerPool.addPeerNoWait(peer, peer.direction)
+proc handlePeer*(peer: Peer, isnormal = true) {.async.} =
+  let res = 
+    if isnormal : peer.network.peerPool.addPeerNoWait(peer, peer.direction)
+    else : peer.network.torpeerPool.addPeerNoWait(peer, peer.direction)
   case res:
   of PeerStatus.LowScoreError, PeerStatus.NoSpaceError:
     # Peer has low score or we do not have enough space in PeerPool,
@@ -1934,9 +1939,75 @@ proc handlePeer*(peer: Peer) {.async.} =
     peer.score = NewPeerScore
     peer.connectionState = Connected
     # We spawn task which will obtain ENR for this peer.
-    resolvePeer(peer)
+    if isnormal: resolvePeer(peer)
     debug "Peer successfully connected", peer = peer,
                                          connections = peer.connections
+
+proc onTorConnEvent(node: Eth2Node, peerId: PeerId, event: ConnEvent) {.async.} =
+  let peer = node.getPeer(peerId)
+  case event.kind
+  of ConnEventKind.Connected:
+    inc peer.connections
+    debug "Tor Peer connection upgraded", peer = $peerId,
+                                      connections = peer.connections
+    if peer.connections == 1:
+      case peer.connectionState
+      of Disconnecting:
+        # We got connection with peer which we currently disconnecting.
+        # Normally this does not happen, but if a peer is being disconnected
+        # while a concurrent (incoming for example) connection attempt happens,
+        # we might end up here
+        debug "Got connection attempt from peer that we are disconnecting",
+             peer = peerId
+        await node.torswitch.disconnect(peerId)
+        return
+      of None:
+        # We have established a connection with the new peer.
+        peer.connectionState = Connecting
+      of Disconnected:
+        # We have established a connection with the peer that we have seen
+        # before - reusing the existing peer object is fine
+        peer.connectionState = Connecting
+        peer.score = 0 # Will be set to NewPeerScore after handshake
+      of Connecting, Connected:
+        # This means that we got notification event from peer which we already
+        # connected or connecting right now. If this situation will happened,
+        # it means bug on `nim-libp2p` side.
+        warn "Got connection attempt from peer which we already connected",
+             peer = peerId
+        await peer.disconnect(FaultOrError)
+        return
+
+      # Store connection direction inside Peer object.
+      if event.incoming:
+        peer.direction = PeerType.Incoming
+      else:
+        peer.direction = PeerType.Outgoing
+
+      await handlePeer(peer, false)
+      #await performProtocolHandshakes(peer, event.incoming)
+  of ConnEventKind.Disconnected:
+    dec peer.connections
+    debug "Lost connection to peer", peer = peerId,
+                                     connections = peer.connections
+
+    if peer.connections == 0:
+      debug "Peer disconnected", peer = $peerId, connections = peer.connections
+
+      # Whatever caused disconnection, avoid connection spamming over tor
+      node.addTorSeen(peerId, SeenTableTimeReconnect)
+
+      let fut = peer.disconnectedFut
+      if not(isNil(fut)):
+        fut.complete()
+        peer.disconnectedFut = nil
+      else:
+        # TODO (cheatfate): This could be removed when bug will be fixed inside
+        # `nim-libp2p`.
+        debug "Got new event while peer is already disconnected",
+              peer = peerId, peer_state = peer.connectionState
+      peer.connectionState = Disconnected
+
 
 proc onConnEvent(node: Eth2Node, peerId: PeerId, event: ConnEvent) {.async.} =
   let peer = node.getPeer(peerId)
@@ -2085,9 +2156,15 @@ proc new(T: type Eth2Node,
 
   proc peerHook(peerId: PeerId, event: ConnEvent): Future[void] {.gcsafe.} =
     onConnEvent(node, peerId, event)
+  
+  proc torpeerHook(peerId: PeerId, event: ConnEvent): Future[void] {.gcsafe.} =
+    onTorConnEvent(node, peerId, event)
 
   switch.addConnEventHandler(peerHook, ConnEventKind.Connected)
   switch.addConnEventHandler(peerHook, ConnEventKind.Disconnected)
+  torswitch.addConnEventHandler(torpeerHook, ConnEventKind.Connected)
+  torswitch.addConnEventHandler(torpeerHook, ConnEventKind.Disconnected)
+
 
   proc scoreCheck(peer: Peer): bool =
     peer.score >= PeerScoreLowLimit
@@ -2108,6 +2185,8 @@ proc new(T: type Eth2Node,
 
   node.peerPool.setScoreCheck(scoreCheck)
   node.peerPool.setOnDeletePeer(onDeletePeer)
+  node.torpeerPool.setScoreCheck(scoreCheck)
+  node.torpeerPool.setOnDeletePeer(onDeletePeer)
 
   node
 
