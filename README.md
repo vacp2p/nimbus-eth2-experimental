@@ -2,7 +2,9 @@
 Please find the official Nimbus repository here: https://github.com/status-im/nimbus-eth2
 
 One of the goals of this branch has been to integrate tor for broadcasting attestations and blocks as published by validators.
-Currently, the changes successfully enable tor integration.
+Currently, the changes successfully enable tor integration. A successfull execution of torbased validator is here
+[tor-validator-goerli](https://goerli.beaconcha.in/validator/86f53cc0e56ae0c6fbe3113a290a52a76cf056339d91f9e166ddbf15a35373d3c455cc387c8ab70db7b3d024113e394d#attestations)
+
 
 ### How to run Tor-integrated Nimbus.
 Checkout this branch, and build.
