@@ -1,6 +1,20 @@
 :warning: This fork is for Vac deep research experiments and PoCs.
 Please find the official Nimbus repository here: https://github.com/status-im/nimbus-eth2
 
+One of the goals of this branch has been to integrate tor for broadcasting attestations and blocks as published by validators.
+Currently, the changes successfully enable tor integration.
+
+### How to run Tor-integrated Nimbus.
+Checkout this branch, and build.
+
+Enable and run tor on your machine if not already e.g. sudo apt install tor
+
+Simply start nimbus client with validator following [start](https://nimbus.guide/quick-start.html)
+
+### What would be transmitted over Tor.
+All attestations and block would be broadcasted on Tor
+
+
 # Nimbus Eth2 (Beacon Chain)
 
 [![Github Actions CI](https://github.com/status-im/nimbus-eth2/actions/workflows/ci.yml/badge.svg?branch=stable)](https://github.com/status-im/nimbus-eth2/actions/workflows/ci.yml?query=branch%3Astable)
