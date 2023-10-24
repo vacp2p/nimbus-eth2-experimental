@@ -1,9 +1,9 @@
 :warning: This fork is for Vac deep research experiments and PoCs.
 Please find the official Nimbus repository here: https://github.com/status-im/nimbus-eth2
 
-One of the goals of this branch has been to integrate tor for broadcasting attestations and blocks as published by validators.
-Currently, the changes successfully enable tor integration. A successfull execution of torbased validator is here
-[tor-validator-goerli](https://goerli.beaconcha.in/validator/86f53cc0e56ae0c6fbe3113a290a52a76cf056339d91f9e166ddbf15a35373d3c455cc387c8ab70db7b3d024113e394d#attestations)
+One of the goals of this branch has been to integrate Tor for broadcasting attestations and blocks as published by validators.
+Currently, the changes successfully enable tor integration. A successfull execution of 10 torbased validator on the same beacon node is here
+[Tor-validator-goerli](https://goerli.beaconcha.in/dashboard?validators=546060,593892,594062,594063,594064,594065,594066,594067,594068,594069)
 
 
 ### How to run Tor-integrated Nimbus.
