@@ -71,19 +71,24 @@ type
     wantedPeers*: int
     hardMaxPeers*: int
     peerPool*: PeerPool[Peer, PeerId]
+    torpeerPool*:PeerPool[Peer, PeerId]
     protocolStates*: seq[RootRef]
     metadata*: altair.MetaData
     connectTimeout*: chronos.Duration
     seenThreshold*: chronos.Duration
     connQueue: AsyncQueue[PeerAddr]
+    torconnQueue: AsyncQueue[PeerAddr]
     seenTable: Table[PeerId, SeenItem]
+    torseenTable: Table[PeerId, SeenItem]
     connWorkers: seq[Future[void]]
     connTable: HashSet[PeerId]
+    torconnTable: HashSet[PeerId]
     forkId*: ENRForkID
     discoveryForkId*: ENRForkID
     forkDigests*: ref ForkDigests
     rng*: ref HmacDrbgContext
     peers*: Table[PeerId, Peer]
+    torpeers*: Table[PeerId, Peer]
     validTopics: HashSet[string]
     peerPingerHeartbeatFut: Future[void]
     peerTrimmerHeartbeatFut: Future[void]
@@ -303,6 +308,16 @@ declareGauge nbc_gossipsub_good_fanout,
 declareGauge nbc_gossipsub_healthy_fanout,
   "numbers of topics with dHigh fanout"
 
+declareGauge nbc_torgossipsub_low_fanout,
+  "numbers of topics over tor with low fanout"
+
+declareGauge nbc_torgossipsub_good_fanout,
+  "numbers of topics over tor with good fanout"
+
+declareGauge nbc_torgossipsub_healthy_fanout,
+  "numbers of topics over tor with dHigh fanout"
+
+
 declareHistogram nbc_resolve_time,
   "Time(s) used while resolving peer information",
    buckets = [1.0, 5.0, 10.0, 20.0, 40.0, 60.0]
@@ -487,6 +502,21 @@ proc isSeen(network: Eth2Node, peerId: PeerId): bool =
       false
     else:
       true
+proc isTorSeen(network: Eth2Node, peerId: PeerId): bool =
+  ## Returns ``true`` if ``peerId`` present in torSeenTable and time period is not
+  ## yet expired.
+  let currentTime = now(chronos.Moment)
+  if peerId notin network.torseenTable:
+    false
+  else:
+    let item = try: network.torseenTable[peerId]
+    except KeyError: raiseAssert "checked with notin"
+    if currentTime >= item.stamp:
+      # Peer is in torSeenTable, but the time period has expired.
+      network.torseenTable.del(peerId)
+      false
+    else:
+      true
 
 proc addSeen(network: Eth2Node, peerId: PeerId,
               period: chronos.Duration) =
@@ -497,6 +527,17 @@ proc addSeen(network: Eth2Node, peerId: PeerId,
       entry.stamp = item.stamp
   do:
     network.seenTable[peerId] = item
+  
+proc addTorSeen(network: Eth2Node, peerId: PeerId,
+              period: chronos.Duration) =
+  ## Adds peer with PeerId ``peerId`` to torSeenTable and timeout ``period``.
+  let item = SeenItem(peerId: peerId, stamp: now(chronos.Moment) + period)
+  withValue(network.torseenTable, peerId, entry) do:
+    if entry.stamp < item.stamp:
+      entry.stamp = item.stamp
+  do:
+    network.torseenTable[peerId] = item
+
 
 proc disconnect*(peer: Peer, reason: DisconnectionReason,
                  notifyOtherPeer = false) {.async.} =
@@ -1295,9 +1336,35 @@ proc checkPeer(node: Eth2Node, peerAddr: PeerAddr): bool =
       trace "Recently connected"
       false
     else:
-      true
+      # check if the normal switch is already using the same connection
+      # avoid any overlap with normal peer use to prevent leakage or correlation
+      if node.torpeerPool.hasPeer(peerId) : 
+        echo "Avoiding Overlap of normal with tor's", peerAddr
+        false
+      else:
+        true
 
-proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {.async.} =
+
+proc torcheckPeer(node: Eth2Node, peerAddr: PeerAddr): bool =
+  logScope: peer = peerAddr.peerId
+  let peerId = peerAddr.peerId
+  if node.torpeerPool.hasPeer(peerId):
+    trace "Already connected over tor"
+    false
+  else:
+    if node.istorSeen(peerId):
+      trace "Recently connected over tor"
+      false
+    else:
+      # check if the normal switch is already using the same connection
+      # avoid any overlap with normal peer use to prevent leakage or correlation
+      if node.peerPool.hasPeer(peerId) : 
+        echo "Avoiding Overlap of tor with normal's ", peerAddr
+        false
+      else:
+        true
+  
+proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
   ## Establish connection with remote peer identified by address ``peerAddr``.
   logScope:
     peer = peerAddr.peerId
@@ -1309,15 +1376,47 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {
   debug "Connecting to discovered peer"
   var deadline = sleepAsync(node.connectTimeout)
 
-  var workfut = if isnotTor:
-    echo isnotTor
+  var workfut =
     node.switch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
     forceDial = true)
-  else : 
-    echo isnotTor
-    node.torSwitch.connect(
+
+  try:
+    # `or` operation will only raise exception of `workfut`, because `deadline`
+    # could not raise exception.
+    await workfut or deadline
+    if workfut.finished():
+      if not deadline.finished():
+        deadline.cancel()
+      inc nbc_successful_dials
+      echo "Connect successful, ", " Switch type: normal", peerAddr
+      echo "Peer pool", len(node.peerPool)
+    else:
+      debug "Connection to remote peer timed out"
+      inc nbc_timeout_dials
+      node.addSeen(peerAddr.peerId, SeenTableTimeTimeout)
+      await cancelAndWait(workfut)
+  except CatchableError as exc:
+    debug "Connection to remote peer failed", msg = exc.msg
+    inc nbc_failed_dials
+    node.addSeen(peerAddr.peerId, SeenTableTimeDeadPeer)
+
+
+
+proc dialTorPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0) {.async.} =
+  ## Establish connection with remote peer identified by address ``peerAddr``.
+  logScope:
+    peer = peerAddr.peerId
+    index = index
+
+  if not(node.torcheckPeer(peerAddr)):
+    return
+
+  debug "Connecting to discovered tor peer"
+  var deadline = sleepAsync(node.connectTimeout)
+
+  var workfut = node.torSwitch.connect(
     peerAddr.peerId,
     peerAddr.addrs,
     forceDial = true)
@@ -1331,17 +1430,17 @@ proc dialPeer(node: Eth2Node, peerAddr: PeerAddr, index = 0, isnotTor = true ) {
       if not deadline.finished():
         deadline.cancel()
       inc nbc_successful_dials
-      echo "Connect successful, ", " Switch type:", isnotTor, peerAddr
-      echo "Peer pool", len(node.peer_pool)
+      echo "Connect successful, ", " Switch type:__", peerAddr
+      echo "Peer pool", len(node.torpeerPool)
     else:
       debug "Connection to remote peer timed out"
       inc nbc_timeout_dials
-      node.addSeen(peerAddr.peerId, SeenTableTimeTimeout)
+      node.addTorSeen(peerAddr.peerId, SeenTableTimeTimeout)
       await cancelAndWait(workfut)
   except CatchableError as exc:
     debug "Connection to remote peer failed", msg = exc.msg
     inc nbc_failed_dials
-    node.addSeen(peerAddr.peerId, SeenTableTimeDeadPeer)
+    node.addTorSeen(peerAddr.peerId, SeenTableTimeDeadPeer)
 
 proc connectWorker(node: Eth2Node, index: int) {.async.} =
   debug "Connection worker started", index = index
@@ -1360,10 +1459,14 @@ proc connectWorker(node: Eth2Node, index: int) {.async.} =
     # excluding peer here after processing.
     node.connTable.excl(remotePeerAddr.peerId)
 
-    let remoteTorPeerAddr = await node.connQueue.popFirst()
-    await node.dialPeer(remoteTorPeerAddr, index, false)
+proc connectTorWorker(node: Eth2Node, index: int) {.async.} =
+  debug "Connection Tor worker started", index = index
+  while true:
+    let remoteTorPeerAddr = await node.torconnQueue.popFirst()
+    if node.torpeerPool.len < node.hardMaxPeers :
+      await node.dialTorPeer(remoteTorPeerAddr, index)
 
-    node.connTable.excl(remoteTorPeerAddr.peerId)
+    node.torconnTable.excl(remoteTorPeerAddr.peerId)
     
     
 proc toPeerAddr(node: Node): Result[PeerAddr, cstring] =
@@ -1464,6 +1567,8 @@ proc trimConnections(node: Eth2Node, count: int) =
   var peersInGracePeriod = 0
   for peer in node.peers.values:
     if peer.connectionState != Connected: continue
+    # do not trim anything related to tor
+    if node.torpeerPool.hasPeer(peer.peerId): continue
 
     # Metadata pinger is used as grace period
     if peer.metadata.isNone:
@@ -1539,6 +1644,72 @@ proc trimConnections(node: Eth2Node, count: int) =
     inc(nbc_cycling_kicked_peers)
     if toKick <= 0: return
 
+template findLowSubnets(topicNameGenerator: untyped,
+                        SubnetIdType: type,
+                        totalSubnets: static int,
+                        pubsub: GossipSub): auto =
+  var
+    lowOutgoingSubnets: BitArray[totalSubnets]
+    notHighOutgoingSubnets: BitArray[totalSubnets]
+    belowDSubnets: BitArray[totalSubnets]
+    belowDOutSubnets: BitArray[totalSubnets]
+
+  for subNetId in 0 ..< totalSubnets:
+    let topic =
+      topicNameGenerator(node.forkId.fork_digest, SubnetIdType(subNetId))
+
+    if pubsub.gossipsub.peers(topic) < pubsub.parameters.dLow:
+      lowOutgoingSubnets.setBit(subNetId)
+
+    if pubsub.gossipsub.peers(topic) < pubsub.parameters.dHigh:
+      notHighOutgoingSubnets.setBit(subNetId)
+
+    # Not subscribed
+    if topic notin pubsub.mesh: continue
+
+    if pubsub.mesh.peers(topic) < pubsub.parameters.dLow:
+      belowDSubnets.setBit(subNetId)
+
+    let outPeers = pubsub.mesh.getOrDefault(topic).countIt(it.outbound)
+    if outPeers < pubsub.parameters.dOut:
+      belowDOutSubnets.setBit(subNetId)
+
+#[
+  nbc_gossipsub_low_fanout.inc(int64(lowOutgoingSubnets.countOnes()))
+  nbc_gossipsub_good_fanout.inc(int64(
+    notHighOutgoingSubnets.countOnes() -
+    lowOutgoingSubnets.countOnes()
+  ))
+  nbc_gossipsub_healthy_fanout.inc(int64(
+    totalSubnets - notHighOutgoingSubnets.countOnes()))
+]#
+
+  if lowOutgoingSubnets.countOnes() > 0:
+    lowOutgoingSubnets
+  elif belowDSubnets.countOnes() > 0:
+    belowDSubnets
+  elif belowDOutSubnets.countOnes() > 0:
+    belowDOutSubnets
+  else:
+    notHighOutgoingSubnets
+
+proc getTorLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
+  # Returns the subnets required to have a healthy tor mesh
+ 
+  nbc_torgossipsub_low_fanout.set(0)
+  nbc_torgossipsub_good_fanout.set(0)
+  nbc_torgossipsub_healthy_fanout.set(0)
+
+  return (
+    findLowSubnets(getAttestationTopic, SubnetId, ATTESTATION_SUBNET_COUNT.int, node.torpubsub),
+    # We start looking one epoch before the transition in order to allow
+    # some time for the gossip meshes to get healthy:
+    if epoch + 1 >= node.cfg.ALTAIR_FORK_EPOCH:
+      findLowSubnets(getSyncCommitteeTopic, SyncSubcommitteeIndex, SYNC_COMMITTEE_SUBNET_COUNT, node.torpubsub)
+    else:
+      default(SyncnetBits)
+  )
+
 proc getLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
   # Returns the subnets required to have a healthy mesh
   # The subnets are computed, to, in order:
@@ -1551,58 +1722,13 @@ proc getLowSubnets(node: Eth2Node, epoch: Epoch): (AttnetBits, SyncnetBits) =
   nbc_gossipsub_good_fanout.set(0)
   nbc_gossipsub_healthy_fanout.set(0)
 
-  template findLowSubnets(topicNameGenerator: untyped,
-                          SubnetIdType: type,
-                          totalSubnets: static int): auto =
-    var
-      lowOutgoingSubnets: BitArray[totalSubnets]
-      notHighOutgoingSubnets: BitArray[totalSubnets]
-      belowDSubnets: BitArray[totalSubnets]
-      belowDOutSubnets: BitArray[totalSubnets]
-
-    for subNetId in 0 ..< totalSubnets:
-      let topic =
-        topicNameGenerator(node.forkId.fork_digest, SubnetIdType(subNetId))
-
-      if node.pubsub.gossipsub.peers(topic) < node.pubsub.parameters.dLow:
-        lowOutgoingSubnets.setBit(subNetId)
-
-      if node.pubsub.gossipsub.peers(topic) < node.pubsub.parameters.dHigh:
-        notHighOutgoingSubnets.setBit(subNetId)
-
-      # Not subscribed
-      if topic notin node.pubsub.mesh: continue
-
-      if node.pubsub.mesh.peers(topic) < node.pubsub.parameters.dLow:
-        belowDSubnets.setBit(subNetId)
-
-      let outPeers = node.pubsub.mesh.getOrDefault(topic).countIt(it.outbound)
-      if outPeers < node.pubsub.parameters.dOut:
-        belowDOutSubnets.setBit(subNetId)
-
-    nbc_gossipsub_low_fanout.inc(int64(lowOutgoingSubnets.countOnes()))
-    nbc_gossipsub_good_fanout.inc(int64(
-      notHighOutgoingSubnets.countOnes() -
-      lowOutgoingSubnets.countOnes()
-    ))
-    nbc_gossipsub_healthy_fanout.inc(int64(
-      totalSubnets - notHighOutgoingSubnets.countOnes()))
-
-    if lowOutgoingSubnets.countOnes() > 0:
-      lowOutgoingSubnets
-    elif belowDSubnets.countOnes() > 0:
-      belowDSubnets
-    elif belowDOutSubnets.countOnes() > 0:
-      belowDOutSubnets
-    else:
-      notHighOutgoingSubnets
-
   return (
-    findLowSubnets(getAttestationTopic, SubnetId, ATTESTATION_SUBNET_COUNT.int),
+    #findLowSubnets(getAttestationTopic, SubnetId, ATTESTATION_SUBNET_COUNT.int, node.pubsub),
+    BitArray[ATTESTATION_SUBNET_COUNT.int](),
     # We start looking one epoch before the transition in order to allow
     # some time for the gossip meshes to get healthy:
     if epoch + 1 >= node.cfg.ALTAIR_FORK_EPOCH:
-      findLowSubnets(getSyncCommitteeTopic, SyncSubcommitteeIndex, SYNC_COMMITTEE_SUBNET_COUNT)
+      findLowSubnets(getSyncCommitteeTopic, SyncSubcommitteeIndex, SYNC_COMMITTEE_SUBNET_COUNT, node.pubsub)
     else:
       default(SyncnetBits)
   )
@@ -1618,7 +1744,7 @@ proc runDiscoveryLoop(node: Eth2Node) {.async.} =
       wantedSyncnetsCount = wantedSyncnets.countOnes()
       outgoingPeers = node.peerPool.lenCurrent({PeerType.Outgoing})
       targetOutgoingPeers = max(node.wantedPeers div 10, 3)
-
+    
     if wantedAttnetsCount > 0 or wantedSyncnetsCount > 0 or
         outgoingPeers < targetOutgoingPeers:
 
@@ -1676,6 +1802,85 @@ proc runDiscoveryLoop(node: Eth2Node) {.async.} =
     # when no peers are in the routing table. Don't run it in continuous loop.
     #
     # Also, give some time to dial the discovered nodes and update stats etc
+    await sleepAsync(15.seconds)
+
+proc runTorDiscoveryLoop(node: Eth2Node) {.async.} =
+  debug "Starting Tor discovery loop"
+
+  while true:
+    let
+      currentEpoch = node.getBeaconTime().slotOrZero.epoch
+      (wantedAttnets, wantedSyncnets) = node.getLowSubnets(currentEpoch)
+      wantedAttnetsCount = wantedAttnets.countOnes()
+      wantedSyncnetsCount = wantedSyncnets.countOnes()
+      outgoingPeers = node.torpeerPool.lenCurrent({PeerType.Outgoing})
+      targetOutgoingPeers = max(node.wantedPeers div 10, 6) # D outdegree
+
+    if wantedAttnetsCount > 0 or wantedSyncnetsCount > 0 or
+        outgoingPeers < targetOutgoingPeers:
+
+      let
+        minScore =
+          if wantedAttnetsCount > 0 or wantedSyncnetsCount > 0:
+            1
+          else:
+            0
+        discoveredNodes = await node.discovery.queryRandom(
+          node.discoveryForkId, wantedAttnets, wantedSyncnets, minScore)
+
+      let newPeers = block:
+        var np = newSeq[PeerAddr]()
+        for discNode in discoveredNodes:
+          let res = discNode.toPeerAddr()
+          if res.isErr():
+            debug "Failed to decode discovery's node address",
+                  node = discNode, errMsg = res.error
+            continue
+
+          let peerAddr = res.get()
+          if node.torcheckPeer(peerAddr) and
+            peerAddr.peerId notin node.torconnTable:
+            np.add(peerAddr)
+        np
+
+      
+      #[
+      let
+        roomCurrent = node.hardMaxPeers - len(node.peerPool)
+        peersToKick = min(newPeers.len - roomCurrent, node.hardMaxPeers div 5)
+
+      # if peersToKick > 0 and newPeers.len > 0:
+      #  node.trimConnections(peersToKick)
+      ]#
+
+      for peerAddr in newPeers:
+          # We adding to pending connections table here, but going
+          # to remove it only in `connectWorker`.
+          node.torconnTable.incl(peerAddr.peerId)
+          await node.torconnQueue.addLast(peerAddr)
+
+      debug "Tor Discovery tick",
+            wanted_peers = node.wantedPeers,
+            current_peers = len(node.torpeerPool),
+            discovered_nodes = len(discoveredNodes),
+            new_peers = len(newPeers)
+
+      if len(newPeers) == 0:
+        let currentPeers = len(node.torpeerPool)
+        if currentPeers <= node.wantedPeers shr 2: #  25%
+          warn "Tor Peer count low, no new peers discovered",
+            discovered_nodes = len(discoveredNodes), new_peers = newPeers,
+            current_peers = currentPeers, wanted_peers = node.wantedPeers
+
+    # Discovery `queryRandom` can have a synchronous fast path for example
+    # when no peers are in the routing table. Don't run it in continuous loop.
+    #
+    # Also, give some time to dial the discovered nodes and update stats etc
+
+    # the tor discovery be more frequent than normal switch
+    # so that peers are readily availabe to reduce any miss rate
+    # and also to let not normal discovery use available peers beforehand 
+    # to avoid starvation
     await sleepAsync(5.seconds)
 
 proc resolvePeer(peer: Peer) =
@@ -1704,8 +1909,10 @@ proc resolvePeer(peer: Peer) =
     nbc_resolve_time.observe(delay.toFloatSeconds())
     debug "Peer's ENR recovered", delay
 
-proc handlePeer*(peer: Peer) {.async.} =
-  let res = peer.network.peerPool.addPeerNoWait(peer, peer.direction)
+proc handlePeer*(peer: Peer, isnormal = true) {.async.} =
+  let res = 
+    if isnormal : peer.network.peerPool.addPeerNoWait(peer, peer.direction)
+    else : peer.network.torpeerPool.addPeerNoWait(peer, peer.direction)
   case res:
   of PeerStatus.LowScoreError, PeerStatus.NoSpaceError:
     # Peer has low score or we do not have enough space in PeerPool,
@@ -1732,9 +1939,75 @@ proc handlePeer*(peer: Peer) {.async.} =
     peer.score = NewPeerScore
     peer.connectionState = Connected
     # We spawn task which will obtain ENR for this peer.
-    resolvePeer(peer)
+    if isnormal: resolvePeer(peer)
     debug "Peer successfully connected", peer = peer,
                                          connections = peer.connections
+
+proc onTorConnEvent(node: Eth2Node, peerId: PeerId, event: ConnEvent) {.async.} =
+  let peer = node.getPeer(peerId)
+  case event.kind
+  of ConnEventKind.Connected:
+    inc peer.connections
+    debug "Tor Peer connection upgraded", peer = $peerId,
+                                      connections = peer.connections
+    if peer.connections == 1:
+      case peer.connectionState
+      of Disconnecting:
+        # We got connection with peer which we currently disconnecting.
+        # Normally this does not happen, but if a peer is being disconnected
+        # while a concurrent (incoming for example) connection attempt happens,
+        # we might end up here
+        debug "Got connection attempt from peer that we are disconnecting",
+             peer = peerId
+        await node.torswitch.disconnect(peerId)
+        return
+      of None:
+        # We have established a connection with the new peer.
+        peer.connectionState = Connecting
+      of Disconnected:
+        # We have established a connection with the peer that we have seen
+        # before - reusing the existing peer object is fine
+        peer.connectionState = Connecting
+        peer.score = 0 # Will be set to NewPeerScore after handshake
+      of Connecting, Connected:
+        # This means that we got notification event from peer which we already
+        # connected or connecting right now. If this situation will happened,
+        # it means bug on `nim-libp2p` side.
+        warn "Got connection attempt from peer which we already connected",
+             peer = peerId
+        await peer.disconnect(FaultOrError)
+        return
+
+      # Store connection direction inside Peer object.
+      if event.incoming:
+        peer.direction = PeerType.Incoming
+      else:
+        peer.direction = PeerType.Outgoing
+
+      await handlePeer(peer, false)
+      #await performProtocolHandshakes(peer, event.incoming)
+  of ConnEventKind.Disconnected:
+    dec peer.connections
+    debug "Lost connection to peer", peer = peerId,
+                                     connections = peer.connections
+
+    if peer.connections == 0:
+      debug "Peer disconnected", peer = $peerId, connections = peer.connections
+
+      # Whatever caused disconnection, avoid connection spamming over tor
+      node.addTorSeen(peerId, SeenTableTimeReconnect)
+
+      let fut = peer.disconnectedFut
+      if not(isNil(fut)):
+        fut.complete()
+        peer.disconnectedFut = nil
+      else:
+        # TODO (cheatfate): This could be removed when bug will be fixed inside
+        # `nim-libp2p`.
+        debug "Got new event while peer is already disconnected",
+              peer = peerId, peer_state = peer.connectionState
+      peer.connectionState = Disconnected
+
 
 proc onConnEvent(node: Eth2Node, peerId: PeerId, event: ConnEvent) {.async.} =
   let peer = node.getPeer(peerId)
@@ -1842,9 +2115,11 @@ proc new(T: type Eth2Node,
     hardMaxPeers: config.hardMaxPeers.get(config.maxPeers * 3 div 2), #*1.5
     cfg: runtimeCfg,
     peerPool: newPeerPool[Peer, PeerId](),
+    torpeerPool: newPeerPool[Peer, PeerId](),
     # Its important here to create AsyncQueue with limited size, otherwise
     # it could produce HIGH cpu usage.
     connQueue: newAsyncQueue[PeerAddr](ConcurrentConnections),
+    torconnQueue: newAsyncQueue[PeerAddr](ConcurrentConnections),
     metadata: metadata,
     forkId: enrForkId,
     discoveryForkId: discoveryForkId,
@@ -1881,9 +2156,15 @@ proc new(T: type Eth2Node,
 
   proc peerHook(peerId: PeerId, event: ConnEvent): Future[void] {.gcsafe.} =
     onConnEvent(node, peerId, event)
+  
+  proc torpeerHook(peerId: PeerId, event: ConnEvent): Future[void] {.gcsafe.} =
+    onTorConnEvent(node, peerId, event)
 
   switch.addConnEventHandler(peerHook, ConnEventKind.Connected)
   switch.addConnEventHandler(peerHook, ConnEventKind.Disconnected)
+  torswitch.addConnEventHandler(torpeerHook, ConnEventKind.Connected)
+  torswitch.addConnEventHandler(torpeerHook, ConnEventKind.Disconnected)
+
 
   proc scoreCheck(peer: Peer): bool =
     peer.score >= PeerScoreLowLimit
@@ -1904,6 +2185,8 @@ proc new(T: type Eth2Node,
 
   node.peerPool.setScoreCheck(scoreCheck)
   node.peerPool.setOnDeletePeer(onDeletePeer)
+  node.torpeerPool.setScoreCheck(scoreCheck)
+  node.torpeerPool.setOnDeletePeer(onDeletePeer)
 
   node
 
@@ -1947,10 +2230,12 @@ proc start*(node: Eth2Node) {.async.} =
 
   for i in 0 ..< ConcurrentConnections:
     node.connWorkers.add connectWorker(node, i)
+    node.connWorkers.add connectTorWorker(node, i)
 
   if node.discoveryEnabled:
     node.discovery.start()
     traceAsyncErrors node.runDiscoveryLoop()
+    traceAsyncErrors node.runTorDiscoveryLoop()
   else:
     notice "Discovery disabled; trying bootstrap nodes",
       nodes = node.discovery.bootstrapRecords.len
@@ -1969,6 +2254,7 @@ proc stop*(node: Eth2Node) {.async.} =
   var waitedFutures =
     @[
         node.switch.stop(),
+        node.torSwitch.stop(),
         node.peerPingerHeartbeat.cancelAndWait(),
         node.peerTrimmerHeartbeatFut.cancelAndWait(),
     ]
