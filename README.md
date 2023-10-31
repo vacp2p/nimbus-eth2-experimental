@@ -7,7 +7,7 @@ Currently, the changes successfully enable tor integration. A successfull execut
 
 
 ### How to run Tor-integrated Nimbus.
-Checkout this branch, and build.
+  Checkout branch [torpush-diffContext](https://github.com/vacp2p/nimbus-eth2-experimental/tree/torpush-diffContext), and build.
 
 Enable and run tor on your machine if not already e.g. sudo apt install tor
 
