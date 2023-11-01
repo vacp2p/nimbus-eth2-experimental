@@ -11,7 +11,7 @@ Checkout this branch, and build.
 
 Enable and run tor on your machine if not already e.g. sudo apt install tor
 
-Simply start nimbus client with validator following [start](https://nimbus.guide/quick-start.html)
+Simply start nimbus beacon node + attached validator following [start](https://nimbus.guide/quick-start.html)
 
 ### What would be transmitted over Tor.
 All attestations and block would be broadcasted on Tor
