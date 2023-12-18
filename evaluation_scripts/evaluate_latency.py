@@ -38,9 +38,9 @@ def parse_sent_log(sent_file):
             slot_match = re.search(slot_pattern, line)
             # Check if matches were found and extract the data
             if signature_match and delay_match and slot_match:
-                signature = signature_match.group(1)
-                delay = delay_match.group(1)
-                slot = slot_match.group(1)
+                signature = signature_match.group(1).strip()
+                delay = delay_match.group(1).strip()
+                slot = slot_match.group(1).strip()
                 #print(f"Signature: {signature}, Delay: {delay}, Slot: {slot}")
                 sent_entries[signature] = [delay,  slot]
     return sent_entries
@@ -53,9 +53,9 @@ def parse_recv_log(recv_file, sent_entries):
         for line in lines:
             match = re.search(delayslotsignature, line)
             if match:
-                signature = match.group(3)
-                delay = match.group(1)
-                slot = match.group(2)
+                signature = match.group(3).strip()
+                delay = match.group(1).strip()
+                slot = match.group(2).strip()
                 for (sent_signature, sent_data) in sent_entries.items():
                     #print(signature, sent_data)
                     if signature == sent_signature:
