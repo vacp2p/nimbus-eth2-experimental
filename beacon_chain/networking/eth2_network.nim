@@ -2984,32 +2984,32 @@ proc broadcastAttestation*(
 proc broadcastVoluntaryExit*(
     node: Eth2Node, exit: SignedVoluntaryExit): Future[SendResult] =
   let topic = getVoluntaryExitsTopic(node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, exit)
+  node.broadcastTor(topic, exit)
 
 proc broadcastAttesterSlashing*(
     node: Eth2Node, slashing: AttesterSlashing): Future[SendResult] =
   let topic = getAttesterSlashingsTopic(
     node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, slashing)
+  node.broadcastTor(topic, slashing)
 
 proc broadcastProposerSlashing*(
     node: Eth2Node, slashing: ProposerSlashing): Future[SendResult] =
   let topic = getProposerSlashingsTopic(
     node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, slashing)
+  node.broadcastTor(topic, slashing)
 
 proc broadcastBlsToExecutionChange*(
     node: Eth2Node, bls_to_execution_change: SignedBLSToExecutionChange):
     Future[SendResult] =
   let topic = getBlsToExecutionChangeTopic(
     node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, bls_to_execution_change)
+  node.broadcastTor(topic, bls_to_execution_change)
 
 proc broadcastAggregateAndProof*(
     node: Eth2Node, proof: SignedAggregateAndProof): Future[SendResult] =
   let topic = getAggregateAndProofsTopic(
     node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, proof)
+  node.broadcastTor(topic, proof)
 
 proc broadcastBeaconBlock*(
     node: Eth2Node, blck: phase0.SignedBeaconBlock): Future[SendResult] =
@@ -3043,31 +3043,31 @@ proc broadcastBlobSidecar*(
   let
     forkPrefix = node.forkDigestAtEpoch(node.getWallEpoch)
     topic = getBlobSidecarTopic(forkPrefix, subnet_id)
-  node.broadcast(topic, blob)
+  node.broadcastTor(topic, blob)
 
 proc broadcastSyncCommitteeMessage*(
     node: Eth2Node, msg: SyncCommitteeMessage,
     subcommitteeIdx: SyncSubcommitteeIndex): Future[SendResult] =
   let topic = getSyncCommitteeTopic(
     node.forkDigestAtEpoch(node.getWallEpoch), subcommitteeIdx)
-  node.broadcast(topic, msg)
+  node.broadcastTor(topic, msg)
 
 proc broadcastSignedContributionAndProof*(
     node: Eth2Node, msg: SignedContributionAndProof): Future[SendResult] =
   let topic = getSyncCommitteeContributionAndProofTopic(
     node.forkDigestAtEpoch(node.getWallEpoch))
-  node.broadcast(topic, msg)
+  node.broadcastTor(topic, msg)
 
 proc broadcastLightClientFinalityUpdate*(
     node: Eth2Node, msg: ForkyLightClientFinalityUpdate):
     Future[SendResult] =
   let topic = getLightClientFinalityUpdateTopic(
     node.forkDigestAtEpoch(msg.contextEpoch))
-  node.broadcast(topic, msg)
+  node.broadcastTor(topic, msg)
 
 proc broadcastLightClientOptimisticUpdate*(
     node: Eth2Node, msg: ForkyLightClientOptimisticUpdate):
     Future[SendResult] =
   let topic = getLightClientOptimisticUpdateTopic(
     node.forkDigestAtEpoch(msg.contextEpoch))
-  node.broadcast(topic, msg)
+  node.broadcastTor(topic, msg)
